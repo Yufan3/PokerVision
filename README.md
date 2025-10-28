@@ -17,28 +17,27 @@
 
 ## 📂 Project Structure
 
+```plaintext
 PokerVision/
 ├── data/
-│ ├── backgrounds/ # Background images for synthetic data
-│ ├── generated/ # Auto-generated images (ignored by git)
-│ ├── raw_cards/ # Source card images (normal, inverted, real)
-│ └── yolo_dataset/ # YOLO-formatted dataset (train/val images & labels)
+│   ├── backgrounds/        # Background images for synthetic data
+│   ├── generated/          # Auto-generated images (ignored by git)
+│   ├── raw_cards/          # Source card images (normal, inverted, real)
+│   └── yolo_dataset/       # YOLO-formatted dataset (train/val images & labels)
 │
-├── runs/ # YOLO training results (ignored by git)
+├── runs/                   # YOLO training results (ignored by git)
 ├── src/
-│ ├── dataset_gen/ # Dataset generation scripts
-│ ├── realtime/ # Real-time detection (webcam_demo.py)
-│ ├── training/ # (Future) model training utils
-│ └── utils/ # Shared helper functions
+│   ├── dataset_gen/        # Dataset generation scripts
+│   ├── realtime/           # Real-time detection (webcam_demo.py)
+│   ├── training/           # (Future) model training utils
+│   └── utils/              # Shared helper functions
 │
-├── weights/ # Model checkpoints (ignored by git)
-├── cards.yaml # YOLO dataset config
-├── requirements.txt # Python dependencies
+├── weights/                # Model checkpoints (ignored by git)
+├── cards.yaml              # YOLO dataset config
+├── requirements.txt        # Python dependencies
 ├── .gitignore
 └── README.md
-
-yaml
-Copy code
+```
 
 ---
 
@@ -48,49 +47,53 @@ Copy code
 ```bash
 git clone https://github.com/Yufan3/PokerVision.git
 cd PokerVision
-2️⃣ Create a Conda environment
-bash
-Copy code
+```
+
+### 2️⃣ Create a Conda environment
+```bash
 conda create -n pokervision python=3.10 -y
 conda activate pokervision
-3️⃣ Install dependencies
-bash
-Copy code
+```
+
+### 3️⃣ Install dependencies
+```bash
 pip install -r requirements.txt
-4️⃣ Verify GPU setup
-bash
-Copy code
+```
+
+### 4️⃣ Verify GPU setup
+```bash
 python -m src.utils.check_cuda
-🧠 Dataset Generation
+```
+
+### 🧠 Dataset Generation
+```bash
 Generate a synthetic dataset by combining random backgrounds and card variants:
-
-bash
-Copy code
 python -m src.dataset_gen.generate_dataset
-The generated data and YOLO labels will appear under:
+```
 
-bash
-Copy code
+The generated data and YOLO labels will appear under:
+```bash
 data/generated/
 data/yolo_dataset/
+```
+
 🏋️‍♂️ Model Training
 Train a YOLO model using your dataset:
-
-bash
-Copy code
+```bash
 yolo detect train model=yolo11s.pt data=cards.yaml epochs=100 imgsz=640 batch=16 device=0
-After training, the best weights will be saved at:
+```
 
-bash
-Copy code
+After training, the best weights will be saved at:
+```bash
 runs/detect/train*/weights/best.pt
+```
+
 🎥 Real-Time Detection
 Run live card detection using your webcam:
-
-bash
-Copy code
+```bash
 python src/realtime/webcam_demo.py
 Press Q to exit the window.
+```
 
 🪪 License
 
