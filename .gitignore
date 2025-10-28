@@ -1,0 +1,67 @@
+# -------------------------------
+# ⚙️ PYTHON & VSCODE
+# -------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+.vscode/
+*.code-workspace
+
+# -------------------------------
+# 🧩 ENVIRONMENTS & DEPENDENCIES
+# -------------------------------
+.env
+.venv/
+venv/
+conda/
+*.conda
+*.ipynb_checkpoints
+*.egg-info/
+
+# -------------------------------
+# 🗂️ GENERATED DATASETS & IMAGES
+# -------------------------------
+data/generated/
+data/yolo_dataset/
+data/yolo_Dataset/
+data/yolo_dataset/
+data/yolo_Dataset/
+data/yolo_dataset/images/
+data/yolo_dataset/labels/
+
+# Raw and augmented cards are small, so keep them.
+# If you want to exclude real images (optional), uncomment:
+# data/raw_cards/real/
+
+# -------------------------------
+# 🧠 YOLO OUTPUTS & TRAINING RUNS
+# -------------------------------
+runs/
+weights/
+*.pt
+*.onnx
+*.engine
+*.mlmodel
+*.tflite
+
+# -------------------------------
+# 📦 CACHE / TEMP FILES
+# -------------------------------
+__cache__/
+*.bak
+*.old
+*.swp
+*.swo
+*.zip
+*.tar
+*.gz
+
+# -------------------------------
+# 💻 OS FILES
+# -------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
