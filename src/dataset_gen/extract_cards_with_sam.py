@@ -22,8 +22,8 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Your real card ratio ~ 1.53
 # We keep any mask whose bounding box has:
 #   1.43 < (height / width) < 1.63
-RATIO_MIN = 1.43
-RATIO_MAX = 1.63
+RATIO_MIN = 1.23
+RATIO_MAX = 1.83
 
 # Target normalized card size (width x height).
 # Use ~1.53 aspect: H = 1.53 * W
@@ -38,7 +38,7 @@ def is_card_mask(mask_dict: dict, img_area: int) -> bool:
       - bounding box aspect ratio
     """
     area = mask_dict.get("area", 0)
-    if area < 0.1 * img_area:
+    if area < 0.03 * img_area:
         return False
 
     x, y, w, h = mask_dict.get("bbox", [0, 0, 0, 0])
@@ -83,11 +83,12 @@ def warp_card_from_mask(bgr_img: np.ndarray, mask_bool: np.ndarray) -> np.ndarra
     if cv2.contourArea(c) < 50:
         return None
 
-    # Try minAreaRect box
+    # Min-area rectangle around the card
     rect = cv2.minAreaRect(c)
-    box = cv2.boxPoints(rect)  # 4x2
-    box = order_points_quad(box)
+    box = cv2.boxPoints(rect)  # 4x2 float32
+    box = order_points_quad(box)  # TL, TR, BR, BL
 
+    # Target quad (portrait-ish: width < height)
     dst = np.array([
         [0,          0],
         [TARGET_W-1, 0],
@@ -95,18 +96,28 @@ def warp_card_from_mask(bgr_img: np.ndarray, mask_bool: np.ndarray) -> np.ndarra
         [0,          TARGET_H-1]
     ], dtype=np.float32)
 
+    # Perspective warp
     M = cv2.getPerspectiveTransform(box, dst)
-    warped = cv2.warpPerspective(bgr_img, M, (TARGET_W, TARGET_H), flags=cv2.INTER_CUBIC)
-
-    # Warp mask to build alpha channel
+    warped_bgr = cv2.warpPerspective(bgr_img, M, (TARGET_W, TARGET_H), flags=cv2.INTER_CUBIC)
     warped_mask = cv2.warpPerspective(mask_u8, M, (TARGET_W, TARGET_H), flags=cv2.INTER_NEAREST)
-    # Clean alpha a bit
+
+    # Clean mask a bit
     warped_mask = cv2.medianBlur(warped_mask, 5)
 
-    rgba = cv2.cvtColor(warped, cv2.COLOR_BGR2RGBA)
-    rgba[:, :, 3] = warped_mask
+    # ✅ Ensure final card is taller than wide (portrait)
+    h_out, w_out = warped_bgr.shape[:2]
+    if h_out < w_out:
+        # rotate both image and mask 90° so height > width
+        warped_bgr = cv2.rotate(warped_bgr, cv2.ROTATE_90_CLOCKWISE)
+        warped_mask = cv2.rotate(warped_mask, cv2.ROTATE_90_CLOCKWISE)
+        h_out, w_out = warped_bgr.shape[:2]
+
+    # Build RGBA output
+    rgba = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGBA)
+    rgba[:, :, 3] = warped_mask  # alpha from mask
 
     return rgba
+
 
 
 def main():
@@ -119,6 +130,13 @@ def main():
         model_type="vit_b",
         checkpoint=str(ROOT / "weights" / "sam_vit_b.pth")
     )
+    # Load SAM mask generator on CPU to avoid GPU OOM
+    # mask_gen, device = load_sam_automatic(
+    #     model_type="vit_b",
+    #     checkpoint=str(ROOT / "weights" / "sam_vit_b.pth"),
+    #     device="cpu"
+    # )
+
     print(f"[INFO] Using device: {device}")
     print(f"[INFO] Reading from: {RAW_DIR}")
     print(f"[INFO] Writing PNG cards to: {OUT_DIR}")
@@ -137,7 +155,17 @@ def main():
             print(f"[WARN] Could not read {img_path.name}, skipping.")
             continue
 
+        # 🔽 Downscale very large images to avoid GPU OOM
         H, W = bgr.shape[:2]
+        max_side = max(H, W)
+        if max_side > 1200:
+            scale = 1200 / max_side
+            new_w = int(W * scale)
+            new_h = int(H * scale)
+            bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            H, W = bgr.shape[:2]
+            H, W = bgr.shape[:2]
+
         img_area = H * W
 
         masks = generate_masks(mask_gen, bgr)
