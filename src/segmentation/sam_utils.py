@@ -50,11 +50,12 @@ def load_sam_automatic(
 
     mask_generator = SamAutomaticMaskGenerator(
         sam,
-        points_per_side=16,            # grid density
-        pred_iou_thresh=0.86,          # quality threshold for mask prediction
-        stability_score_thresh=0.92,   # filter unstable masks
+        points_per_side=8,            # grid density
+        pred_iou_thresh=0.88,          # quality threshold for mask prediction
+        stability_score_thresh=0.90,   # filter unstable masks
         crop_n_layers=0,               # full-image run, no pyramid
-        min_mask_region_area=500,      # ignore tiny blobs
+        crop_n_points_downscale_factor=2,
+        min_mask_region_area=2500,      # ignore tiny blobs
     )
 
     print("[INFO] SAM ready.")
