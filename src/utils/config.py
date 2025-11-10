@@ -12,9 +12,42 @@ IMAGES_DIR = GENERATED_DIR / "images"
 LABELS_DIR = GENERATED_DIR / "labels"
 
 RAW_CARDS_DIR = DATA_DIR / "raw_cards"
-NORMAL_DIR = RAW_CARDS_DIR / "normal"
-INVERTED_DIR = RAW_CARDS_DIR / "inverted"
-REAL_DIR = RAW_CARDS_DIR / "real"  # optional future folder for actual photos
+
+# Existing styles
+NORMAL_DIR       = RAW_CARDS_DIR / "normal"
+INVERTED_DIR     = RAW_CARDS_DIR / "inverted"
+
+# Real card styles (you can comment out any you don’t like)
+REAL1_DIR        = RAW_CARDS_DIR / "real1"
+REAL2_DIR        = RAW_CARDS_DIR / "real2"
+REAL_INVERTED_DIR = RAW_CARDS_DIR / "realinverted"
+
+# (Optional: if your old `real` folder is still good, you can keep it)
+# REAL_DIR        = RAW_CARDS_DIR / "real"
+
+# A single list of all style directories the generator should use
+CARD_STYLE_DIRS = [
+    NORMAL_DIR,
+    INVERTED_DIR,
+    REAL1_DIR,
+    REAL2_DIR,
+    REAL_INVERTED_DIR,
+    # REAL_DIR,   # uncomment if you also want to include data/raw_cards/real
+]
+
+# Group styles into 3 logical types and set sampling weights
+STYLE_GROUP_DIRS = {
+    "normal":   [NORMAL_DIR],
+    "inverted": [INVERTED_DIR],
+    "real":     [REAL1_DIR, REAL2_DIR, REAL_INVERTED_DIR],
+}
+
+# Desired probabilities when sampling a card style
+STYLE_WEIGHTS = {
+    "normal":   0.20,  # 20%
+    "inverted": 0.10,  # 10%
+    "real":     0.70,  # 70% (across all real* dirs)
+}
 
 # Where weights (trained YOLO checkpoints) will go
 WEIGHTS_DIR = PROJECT_ROOT / "weights"
@@ -36,9 +69,7 @@ def ensure_dirs():
         IMAGES_DIR,
         LABELS_DIR,
         RAW_CARDS_DIR,
-        NORMAL_DIR,
-        INVERTED_DIR,
-        REAL_DIR,
+        CARD_STYLE_DIRS,
         WEIGHTS_DIR,
     ]:
         d.mkdir(parents=True, exist_ok=True)

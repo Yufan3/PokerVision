@@ -8,14 +8,15 @@ import math
 
 from src.utils.config import (
     ensure_dirs,
-    NORMAL_DIR,
-    INVERTED_DIR,
-    REAL_DIR,
+    STYLE_GROUP_DIRS,
+    STYLE_WEIGHTS,
     BACKGROUNDS_DIR,
     IMAGES_DIR,
     LABELS_DIR,
     CARD_CLASSES,
 )
+
+
 
 from src.dataset_gen.yolo_label_utils import bbox_to_yolo
 
@@ -26,37 +27,71 @@ from src.dataset_gen.yolo_label_utils import bbox_to_yolo
 
 def load_card_variants():
     """
-    Load card variants from /normal, /inverted, and /real.
-    The real cards are automatically scaled down by 0.7× to better match size proportions.
+    Build a dict of the form:
+
+        {
+          "AS": {
+             "normal":   [PIL.Image, ...],
+             "inverted": [PIL.Image, ...],
+             "real":     [PIL.Image, ...],
+          },
+          "2D": {...},
+          ...
+        }
+
+    using STYLE_GROUP_DIRS from config.py
     """
-    style_dirs = {
-        "normal": NORMAL_DIR,
-        "inverted": INVERTED_DIR,
-        "real": REAL_DIR,
+    style_names = list(STYLE_GROUP_DIRS.keys())
+    variants = {
+        cls: {style: [] for style in style_names}
+        for cls in CARD_CLASSES
     }
 
-    variants = {cls: [] for cls in CARD_CLASSES}
-
     for cls in CARD_CLASSES:
-        for style_name, style_dir in style_dirs.items():
-            candidate = style_dir / f"{cls}.png"
-            if candidate.exists():
-                img = Image.open(candidate).convert("RGBA")
+        for style, dir_list in STYLE_GROUP_DIRS.items():
+            for d in dir_list:
+                candidate = d / f"{cls}.png"
+                if candidate.exists():
+                    img = Image.open(candidate).convert("RGBA")
+                    variants[cls][style].append(img)
 
-                # Scale down real cards slightly (they're higher-res photos)
-                if style_name == "real":
-                    w, h = img.size
-                    img = img.resize((int(w * 0.7), int(h * 0.7)), Image.BICUBIC)
-
-                variants[cls].append(img)
-
-    # Report missing classes
-    for cls, imgs in variants.items():
-        if len(imgs) == 0:
+    # Warn if any card is completely missing
+    for cls, style_dict in variants.items():
+        if all(len(imgs) == 0 for imgs in style_dict.values()):
             print(f"[WARN] No variants found for {cls}")
 
     return variants
 
+
+def choose_card_image(card_variants_for_cls):
+    """
+    card_variants_for_cls is a dict like:
+        {"normal": [imgs...], "inverted": [...], "real": [...]}
+
+    We sample a style according to STYLE_WEIGHTS (normalized over
+    available styles that actually have images), then pick a random
+    image from that style.
+    """
+    # Keep only styles that actually have at least 1 image
+    available_styles = [
+        s for s, imgs in card_variants_for_cls.items()
+        if len(imgs) > 0
+    ]
+    if not available_styles:
+        return None  # caller should handle this
+
+    # Build weights for the available styles
+    weights = [STYLE_WEIGHTS.get(s, 0.0) for s in available_styles]
+    if sum(weights) <= 0:
+        # fallback: uniform if all weights are zero
+        weights = [1.0] * len(available_styles)
+
+    # Sample style according to the desired probability
+    style_choice = random.choices(available_styles, weights=weights, k=1)[0]
+
+    # Random image within that style
+    img = random.choice(card_variants_for_cls[style_choice]).copy()
+    return img
 
 
 def load_backgrounds():
@@ -102,8 +137,10 @@ def random_single_card_instances(card_variants, W, H, num_cards):
     )
 
     for cls in chosen_classes:
-        # pick style
-        base_img = random.choice(card_variants[cls]).copy()
+        # pick style with desired probabilities
+        base_img = choose_card_image(card_variants[cls])
+        if base_img is None:
+            continue
 
         # scale:
         # 65% normal, 35% zoomed-in large
@@ -182,7 +219,18 @@ def fan_cluster_instances(card_variants, W, H):
     # we'll treat index 0 = far left/back, index k-1 = far right/front
     # so we keep the order we sampled, that's fine
 
-    base_images = [random.choice(card_variants[c]).copy() for c in chosen_classes]
+    base_images = []
+    for c in chosen_classes:
+        img = choose_card_image(card_variants[c])
+        if img is not None:
+            base_images.append(img)
+        else:
+            base_images.append(None)
+
+    # If any card has no available image, just skip fan for safety
+    if any(img is None for img in base_images):
+        return []
+
 
     # scale: "in hand" cards should be decently large
     base_card_width = base_images[0].size[0]
@@ -371,7 +419,7 @@ def main():
         print("[FATAL] You have no cards in data/raw_cards/(normal|inverted|real).")
         return
 
-    num_samples = 1000  # scale up later
+    num_samples = 10  # scale up later
 
     for i in tqdm(range(num_samples), desc="Generating synthetic dataset"):
         bg_img = random.choice(backgrounds)
