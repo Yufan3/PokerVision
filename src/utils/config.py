@@ -59,17 +59,24 @@ CARD_CLASSES = [r + s for r in RANKS for s in SUITS]  # e.g. 2C, 2D, ..., AS
 
 def ensure_dirs():
     """
-    Create required directories if they don't exist.
-    Safe to call at the start of dataset generation.
+    Make sure all necessary folders exist:
+      - data/, backgrounds/, generated/images/, generated/labels/
+      - raw_cards/ and all style subfolders (normal, inverted, real1, real2, realinverted)
     """
-    for d in [
+    dirs_to_create = [
         DATA_DIR,
         BACKGROUNDS_DIR,
         GENERATED_DIR,
         IMAGES_DIR,
         LABELS_DIR,
         RAW_CARDS_DIR,
-        CARD_STYLE_DIRS,
-        WEIGHTS_DIR,
-    ]:
+    ]
+
+    # Add each style directory from STYLE_GROUP_DIRS
+    for dir_list in STYLE_GROUP_DIRS.values():
+        dirs_to_create.extend(dir_list)
+
+    # Create them
+    for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
+
