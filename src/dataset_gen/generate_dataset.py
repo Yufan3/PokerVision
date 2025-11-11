@@ -137,31 +137,40 @@ def random_single_card_instances(card_variants, W, H, num_cards):
     )
 
     for cls in chosen_classes:
-        # pick style with desired probabilities
+        # pick style with desired probabilities (70% real, 20% normal, 10% inverted)
         base_img = choose_card_image(card_variants[cls])
         if base_img is None:
             continue
 
-        # scale:
-        # 65% normal, 35% zoomed-in large
-        # make scale adaptive to background width
-        base_card_width = base_img.size[0]
-        scale_base = (W / base_card_width) * 0.15  # 15% of bg width looks like a realistic card
+        orig_w, orig_h = base_img.size
+        if orig_w == 0 or orig_h == 0:
+            continue
 
-        if random.random() < 0.35:
-            scale_factor = random.uniform(1.1, 2.1)
+        # Decide how big this card should be RELATIVE to the background.
+        # Keep two modes:
+        #   - normal cards: smaller
+        #   - zoomed-in cards: a bit larger, but never crazy big
+        r = random.random()
+        if r < 0.35:
+            # "zoomed-in" single card
+            frac_min, frac_max = 0.20, 0.30   # % of background width
         else:
-            scale_factor = random.uniform(0.5, 1.1)
+            # normal single card
+            frac_min, frac_max = 0.10, 0.18   # % of background width
 
-        scale = scale_base * scale_factor
+        target_frac = random.uniform(frac_min, frac_max)
+        target_w = int(W * target_frac)
 
+        # Resize to this target width, preserving aspect ratio
+        scale = target_w / float(orig_w)
+        new_w = target_w
+        new_h = int(orig_h * scale)
 
-        new_w = int(base_img.size[0] * scale)
-        new_h = int(base_img.size[1] * scale)
         card_img = base_img.resize((new_w, new_h), Image.BICUBIC)
 
+
         # rotation
-        angle = random.uniform(-30, 30)
+        angle = random.uniform(-90, 90)
         card_img = card_img.rotate(angle, expand=True)
 
         rot_w, rot_h = card_img.size
@@ -233,10 +242,10 @@ def fan_cluster_instances(card_variants, W, H):
 
 
     # scale: "in hand" cards should be decently large
-    base_card_width = base_images[0].size[0]
-    scale_base = (W / base_card_width) * 0.17  # ~17% of frame width baseline
-    scale_factor = random.uniform(1.0, 1.3)
-    scale = scale_base * scale_factor
+    fan_frac_min = 0.16  # 16% of bg width
+    fan_frac_max = 0.22  # 22% of bg width
+    fan_width_fraction = random.uniform(fan_frac_min, fan_frac_max)
+    target_card_w = int(W * fan_width_fraction)
 
     # rotation plan:
     # - card 0 (back/left)  : least clockwise
@@ -253,10 +262,16 @@ def fan_cluster_instances(card_variants, W, H):
     anchor_y = random.randint(int(0.55 * H), int(0.95 * H))
 
     for i, (cls, img_raw) in enumerate(zip(chosen_classes, base_images)):
-        # Resize this card
-        new_w = int(img_raw.size[0] * scale)
-        new_h = int(img_raw.size[1] * scale)
+        # Resize this card so its width is EXACTLY target_card_w
+        orig_w, orig_h = img_raw.size
+        if orig_w == 0 or orig_h == 0:
+            continue
+
+        scale = target_card_w / float(orig_w)
+        new_w = target_card_w
+        new_h = int(orig_h * scale)
         card_img = img_raw.resize((new_w, new_h), Image.BICUBIC)
+
 
         # Angle grows with i so that last card is the most clockwise.
         angle = start_angle - i * step_deg
