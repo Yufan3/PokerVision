@@ -1,0 +1,6 @@
+path: data/yolo_cards_single
+train: images/train
+val: images/val
+
+names:
+  0: card

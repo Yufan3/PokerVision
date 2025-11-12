@@ -434,7 +434,7 @@ def main():
         print("[FATAL] You have no cards in data/raw_cards/(normal|inverted|real).")
         return
 
-    num_samples = 10  # scale up later
+    num_samples = 1000  # scale up later
 
     for i in tqdm(range(num_samples), desc="Generating synthetic dataset"):
         bg_img = random.choice(backgrounds)
