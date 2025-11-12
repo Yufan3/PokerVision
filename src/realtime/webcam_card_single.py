@@ -1,4 +1,3 @@
-# src/tools/webcam_card_single.py
 import argparse
 import time
 from collections import deque
@@ -11,10 +10,10 @@ from ultralytics import YOLO
 # --- defaults (can be overridden by CLI) ---
 DEFAULT_MODEL = "runs/detect/train3/weights/best.pt"  # single-class 'card' detector
 DEFAULT_SOURCE = 0
-DEFAULT_CONF = 0.20
-DEFAULT_IMG_SZ = 672
-IOU_MATCH_THRESHOLD = 0.45  # track association threshold
-SMOOTH_FRAMES = 6           # temporal smoothing length
+DEFAULT_CONF = 0.25
+DEFAULT_IMG_SZ = 704          # ↑ slightly bigger improves small/partial cards
+IOU_MATCH_THRESHOLD = 0.40    # your tracker threshold (kept)
+SMOOTH_FRAMES = 15            # your temporal smoothing (kept)
 FPS_SMOOTH_ALPHA = 0.1
 
 def iou_xyxy(a, b):
@@ -27,6 +26,48 @@ def iou_xyxy(a, b):
     denom = areaA + areaB - inter
     return inter / denom if denom > 0 else 0.0
 
+def refine_bbox_with_edges(frame, box, pad=8):
+    # box: [x1,y1,x2,y2], returns (ok, refined_box)
+    H, W = frame.shape[:2]
+    x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+    x2 = min(W-1, x2 + pad); y2 = min(H-1, y2 + pad)
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return False, box
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False, box
+
+    c = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < 0.02 * roi.shape[0] * roi.shape[1]:
+        return False, box
+
+    rect = cv2.minAreaRect(c)
+    (cx, cy), (w, h), ang = rect
+    w, h = max(w,1), max(h,1)
+    ratio = max(w, h) / max(1.0, min(w, h))
+
+    # card-like aspect after rotation (loose range, adjust if needed)
+    if ratio < 1.2 or ratio > 2.0:
+        return False, box
+
+    box_pts = cv2.boxPoints(rect)  # 4x2
+    box_pts[:,0] += x1; box_pts[:,1] += y1
+    xA, yA = np.min(box_pts, axis=0).astype(int)
+    xB, yB = np.max(box_pts, axis=0).astype(int)
+    xA = max(0, xA); yA = max(0, yA); xB = min(W-1, xB); yB = min(H-1, yB)
+    if xB <= xA or yB <= yA:
+        return False, box
+    return True, np.array([xA, yA, xB, yB], dtype=float)
+
+
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = YOLO(args.model)
@@ -35,7 +76,6 @@ def main(args):
 
     cap = cv2.VideoCapture(args.source, cv2.CAP_DSHOW)  # force DirectShow on Windows
     if not cap.isOpened():
-        # fallback backends
         cap = cv2.VideoCapture(args.source)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera source {args.source}")
@@ -53,7 +93,7 @@ def main(args):
         # dets: list[(box, conf)]
         for box, conf in dets:
             best_i, best_id = 0.0, None
-            for tid, tr in tracks.items():
+            for tid, tr in list(tracks.items()):
                 i = iou_xyxy(box, tr["bbox"])
                 if i > best_i and i > IOU_MATCH_THRESHOLD:
                     best_i, best_id = i, tid
@@ -79,12 +119,13 @@ def main(args):
         if not ok:
             break
 
-        # inference (set imgsz & conf via predict kwargs)
+        # Inference tuned for overlaps/fans: higher NMS IoU, larger imgsz, more max_det
         res = model.predict(
             frame,
             imgsz=args.imgsz,
             conf=args.conf,
-            iou=0.5,            # NMS iou
+            iou=0.60,           # ↑ allow overlapping boxes to coexist
+            max_det=50,        # ↑ crowded scenes
             verbose=False,
             device=0 if device == "cuda" else None,
         )[0]
@@ -97,12 +138,18 @@ def main(args):
             for box, c in zip(boxes, confs):
                 dets.append((box, float(c)))
 
+        refined = []
+        for box, c in dets:
+            ok, tight = refine_bbox_with_edges(frame, box)
+            refined.append((tight if ok else box, c))
+        dets = refined
+
+
         matched = match_tracks(dets)
 
         # draw
         for tid, box in matched:
             x1, y1, x2, y2 = [int(v) for v in box]
-            # smoothed conf
             conf_avg = float(np.mean(tracks[tid]["conf_hist"])) if tracks[tid]["conf_hist"] else 0.0
             cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 220, 60), 2)
             cv2.putText(frame, f"card {conf_avg:.2f}", (x1, max(18, y1 - 6)),
@@ -138,3 +185,4 @@ if __name__ == "__main__":
     ap.add_argument("--imgsz", type=int, default=DEFAULT_IMG_SZ)
     args = ap.parse_args()
     main(args)
+
