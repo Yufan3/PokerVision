@@ -110,6 +110,153 @@ def load_backgrounds():
         print("[ERROR] No backgrounds found in data/backgrounds/")
     return backgrounds
 
+def draw_fake_occluders(bg_img, num_shapes=3):
+    """
+    Draw random rectangles/ellipses that vaguely resemble hands/phones etc.
+    This teaches YOLO 'not-card' patterns.
+    """
+    bg = bg_img.copy()
+    W, H = bg.size
+    img = np.array(bg)
+
+    for _ in range(num_shapes):
+        # random position and size
+        w = random.randint(int(0.05 * W), int(0.25 * W))
+        h = random.randint(int(0.05 * H), int(0.25 * H))
+        x1 = random.randint(0, max(0, W - w))
+        y1 = random.randint(0, max(0, H - h))
+        x2 = x1 + w
+        y2 = y1 + h
+
+        # choose a 'phone-like' or 'hand-like' color
+        if random.random() < 0.5:
+            # dark gray / black-ish (phone, wallet, etc.)
+            color = (
+                random.randint(10, 40),
+                random.randint(10, 40),
+                random.randint(10, 40),
+            )
+        else:
+            # skin-ish tone
+            color = (
+                random.randint(150, 220),
+                random.randint(130, 200),
+                random.randint(100, 180),
+            )
+
+        # rectangle or ellipse
+        shape_type = random.choice(["rect", "ellipse"])
+        if shape_type == "rect":
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=-1)
+        else:
+            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            axes = (w // 2, h // 2)
+            cv2.ellipse(img, center, axes, angle=random.randint(0, 180),
+                        startAngle=0, endAngle=360, color=color, thickness=-1)
+
+    out = Image.fromarray(img)
+    return out
+
+
+def make_hard_negative_example(backgrounds):
+    """
+    Build a 'no cards' image that still looks card-ish:
+    - background + fake occluder shapes
+    - returns img_bgr, empty_annotations
+    """
+    bg_img = random.choice(backgrounds)
+    img_with_shapes = draw_fake_occluders(bg_img, num_shapes=random.randint(2, 6))
+    img_bgr = np.array(img_with_shapes)[:, :, ::-1]  # RGB->BGR
+    annotations = []  # NO labels => hard negative
+    return img_bgr, annotations
+
+def hard_fan_instances(card_variants, W, H):
+    """
+    A harder version of fan_cluster_instances:
+    - tighter angles (cards almost parallel)
+    - more cards
+    - fans near edges / partially off-frame
+    """
+    placements = []
+
+    # only keep card classes that actually have at least one image
+    available_classes = [
+        cls for cls, style_dict in card_variants.items()
+        if any(len(imgs) > 0 for imgs in style_dict.values())
+    ]
+    if not available_classes:
+        return placements
+
+    # 3–6 cards in a tight fan
+    k = random.randint(3, 6)
+    chosen_classes = random.sample(available_classes, k=min(k, len(available_classes)))
+
+    # pick one image for each class using style weights
+    base_images = []
+    for c in chosen_classes:
+        img = choose_card_image(card_variants[c])
+        base_images.append(img)
+
+    # if any class had no available image, bail out
+    if any(img is None for img in base_images):
+        return placements
+
+    # base scale
+    base_card_width = base_images[0].size[0]
+    scale_base = (W / base_card_width) * 0.22  # slightly larger than normal fan
+    scale_factor = random.uniform(1.0, 1.4)
+    scale = scale_base * scale_factor
+
+    start_angle = random.uniform(-10, 10)   # cards almost vertical
+    step_deg    = random.uniform(4, 8)      # very tight spread
+
+    # anchor somewhere where part of the fan may fall outside frame
+    anchor_x = random.randint(int(0.4 * W), int(0.95 * W))
+    anchor_y = random.randint(int(0.4 * H), int(0.95 * H))
+
+    for i, (cls, img_raw) in enumerate(zip(chosen_classes, base_images)):
+        orig_w, orig_h = img_raw.size
+        if orig_w == 0 or orig_h == 0:
+            continue
+
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        card_img = img_raw.resize((new_w, new_h), Image.BICUBIC)
+
+        angle = start_angle - i * step_deg
+
+        grip_x_local = new_w * 0.9
+        grip_y_local = new_h * 0.96
+
+        cx = new_w / 2.0
+        cy = new_h / 2.0
+        theta = math.radians(angle)
+
+        dx = grip_x_local - cx
+        dy = grip_y_local - cy
+
+        grip_rot_x = cx + (dx * math.cos(theta) - dy * math.sin(theta))
+        grip_rot_y = cy + (dx * math.sin(theta) + dy * math.cos(theta))
+
+        rotated = card_img.rotate(angle, expand=True)
+        rot_w, rot_h = rotated.size
+
+        dist_from_front = (k - 1) - i
+        fan_offset_x = -dist_from_front * (0.10 * new_w)
+        fan_offset_y = -dist_from_front * (0.04 * new_h)
+
+        xmin = int(anchor_x + fan_offset_x - grip_rot_x)
+        ymin = int(anchor_y + fan_offset_y - grip_rot_y)
+        xmax = xmin + rot_w
+        ymax = ymin + rot_h
+
+        placements.append({
+            "cls": cls,
+            "img": rotated,
+            "bbox": (xmin, ymin, xmax, ymax),
+        })
+
+    return placements
 
 # -----------------------
 # Card placement routines
@@ -373,28 +520,62 @@ def compose_on_background(bg_img, placements):
 
 def apply_post_augs(img_bgr):
     """
-    Simulate webcam: brightness, blur, noise.
+    Heavier 'camera / phone' style augs:
+    - stronger brightness/contrast jitter
+    - random color cast
+    - Gaussian / motion blur
+    - Gaussian noise
+    - JPEG compression artifacts
     """
     out = img_bgr.astype(np.float32)
 
-    # brightness / contrast
-    if random.random() < 0.7:
-        alpha = random.uniform(0.8, 1.2)  # contrast
-        beta = random.uniform(-20, 20)    # brightness
+    # --- brightness & contrast ---
+    if random.random() < 0.9:
+        alpha = random.uniform(0.7, 1.4)   # contrast
+        beta  = random.uniform(-40, 40)    # brightness
         out = out * alpha + beta
 
-    # blur
-    if random.random() < 0.3:
-        k = random.choice([3,5])
-        out = cv2.GaussianBlur(out, (k, k), sigmaX=1.0)
+    # --- subtle color cast / white balance shift ---
+    if random.random() < 0.7:
+        # RGB scaling
+        rb = random.uniform(0.9, 1.1)
+        gb = random.uniform(0.9, 1.1)
+        bb = random.uniform(0.9, 1.1)
+        color_gain = np.array([bb, gb, rb], dtype=np.float32).reshape(1, 1, 3)
+        out = out * color_gain
 
-    # noise
-    if random.random() < 0.4:
-        noise = np.random.normal(0, 8, out.shape).astype(np.float32)
+    # --- blur (Gaussian or cheap 'motion' blur) ---
+    if random.random() < 0.6:
+        if random.random() < 0.5:
+            k = random.choice([3, 5, 7])
+            out = cv2.GaussianBlur(out, (k, k), sigmaX=random.uniform(0.8, 2.0))
+        else:
+            # simple motion blur: average along horizontal or vertical
+            k = random.choice([3, 5, 7])
+            kernel = np.zeros((k, k), np.float32)
+            if random.random() < 0.5:
+                kernel[int((k - 1) / 2), :] = 1.0 / k
+            else:
+                kernel[:, int((k - 1) / 2)] = 1.0 / k
+            out = cv2.filter2D(out, -1, kernel)
+
+    # --- Gaussian noise ---
+    if random.random() < 0.7:
+        sigma = random.uniform(5, 18)
+        noise = np.random.normal(0, sigma, out.shape).astype(np.float32)
         out = out + noise
+
+    # --- JPEG compression artifacts ---
+    if random.random() < 0.6:
+        quality = random.randint(25, 70)  # lower = more artifacts
+        enc_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        ok, enc = cv2.imencode(".jpg", np.clip(out, 0, 255).astype(np.uint8), enc_param)
+        if ok:
+            out = cv2.imdecode(enc, cv2.IMREAD_COLOR).astype(np.float32)
 
     out = np.clip(out, 0, 255).astype(np.uint8)
     return out
+
 
 
 def save_example(idx, img_bgr, annotations):
@@ -434,20 +615,41 @@ def main():
         print("[FATAL] You have no cards in data/raw_cards/(normal|inverted|real).")
         return
 
-    num_samples = 1000  # scale up later
+    num_samples = 1200  # scale up later
+    HARD_NEG_PROB = 0.10   # % images with no cards but card-like clutter
+    HARD_POS_PROB = 0.15   # % images as 'hard' fans
+
 
     for i in tqdm(range(num_samples), desc="Generating synthetic dataset"):
         bg_img = random.choice(backgrounds)
         W, H = bg_img.size
 
-        # With 40% probability, generate a fanned "hand"
-        if random.random() < 0.4:
-            placements = fan_cluster_instances(card_variants, W, H)
-            # plus maybe add 0-2 scattered single cards on table for realism
-            extra = random_single_card_instances(card_variants, W, H, num_cards=random.randint(0, 2))
+        mode_r = random.random()
+
+        # --- 1) HARD NEGATIVE: no cards, just background + fake occluders ---
+        if mode_r < HARD_NEG_PROB:
+            img_bgr, ann = make_hard_negative_example(backgrounds)
+            # still apply camera-style augs
+            img_bgr = apply_post_augs(img_bgr)
+            # write an empty label file so YOLO sees this as a negative
+            save_example(i, img_bgr, [])
+            continue
+
+        # --- 2) HARD POSITIVE: nasty overlapping fan near edges ---
+        elif mode_r < HARD_NEG_PROB + HARD_POS_PROB:
+            placements = hard_fan_instances(card_variants, W, H)
+            # optionally add 0–1 extra stray card somewhere else
+            extra = random_single_card_instances(card_variants, W, H, num_cards=random.randint(0, 1))
             placements.extend(extra)
+
+        # --- 3) NORMAL MIXTURE (your existing behaviour) ---
         else:
-            placements = random_single_card_instances(card_variants, W, H, num_cards=random.randint(2, 7))
+            if random.random() < 0.4:
+                placements = fan_cluster_instances(card_variants, W, H)
+                extra = random_single_card_instances(card_variants, W, H, num_cards=random.randint(0, 2))
+                placements.extend(extra)
+            else:
+                placements = random_single_card_instances(card_variants, W, H, num_cards=random.randint(2, 7))
 
         img_bgr, ann = compose_on_background(bg_img, placements)
         img_bgr = apply_post_augs(img_bgr)
