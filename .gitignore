@@ -26,23 +26,9 @@ env/
 # -----------------------------
 # Project: Dataset Generation Output
 # -----------------------------
-data/generated/
-
-data/yolo_cards_seg/
-data/yolo_cards_seg/images/
-data/yolo_cards_seg/images/train/
-data/yolo_cards_seg/images/val/
-data/yolo_cards_seg/labels/
-data/yolo_cards_seg/labels/train/
-data/yolo_cards_seg/labels/val/
-
 data/yolo_cards_single/
-data/yolo_cards_single/images/
-data/yolo_cards_single/images/train/
-data/yolo_cards_single/images/val/
-data/yolo_cards_single/labels/
-data/yolo_cards_single/labels/train/
-data/yolo_cards_single/labels/val/ 
+data/yolo_cards_seg/
+data/generated/
 
 # Do NOT ignore raw_cards or backgrounds (these are source assets)
 !data/raw_cards/
