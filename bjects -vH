@@ -1,0 +1,5 @@
+[33m5f8a9ab[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m Ensure generated data is ignored
+[33m09d15d3[m Clean project structure, add optimized .gitignore, finalize dataset generator
+[33mc71a175[m More aggresive data aug
+[33m1f089a2[m update the realtime computing algorithm
+[33mb8eecc8[m updated YOLO v11 model only for detecting cards. will implement another CNN for catagorizing ranks and suits
