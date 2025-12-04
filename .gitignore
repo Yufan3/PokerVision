@@ -1,67 +1,80 @@
-# -------------------------------
-# ⚙️ PYTHON & VSCODE
-# -------------------------------
+# -----------------------------
+# Python
+# -----------------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.pkl
+*.pickle
 *.log
-*.tmp
-.vscode/
-*.code-workspace
 
-# -------------------------------
-# 🧩 ENVIRONMENTS & DEPENDENCIES
-# -------------------------------
-.env
+# Virtual environments
 .venv/
 venv/
-conda/
-*.conda
-*.ipynb_checkpoints
-*.egg-info/
+env/
 
-# -------------------------------
-# 🗂️ GENERATED DATASETS & IMAGES
-# -------------------------------
+# Jupyter
+.ipynb_checkpoints/
+
+# -----------------------------
+# VSCode
+# -----------------------------
+.vscode/
+!.vscode/settings.json
+
+# -----------------------------
+# Project: Dataset Generation Output
+# -----------------------------
 data/generated/
-data/yolo_dataset/
-data/yolo_Dataset/
-data/yolo_dataset/
-data/yolo_Dataset/
-data/yolo_dataset/images/
-data/yolo_dataset/labels/
 
-# Raw and augmented cards are small, so keep them.
-# If you want to exclude real images (optional), uncomment:
-# data/raw_cards/real/
+data/yolo_cards_seg/
+data/yolo_cards_seg/images/
+data/yolo_cards_seg/images/train/
+data/yolo_cards_seg/images/val/
+data/yolo_cards_seg/labels/
+data/yolo_cards_seg/labels/train/
+data/yolo_cards_seg/labels/val/
 
-# -------------------------------
-# 🧠 YOLO OUTPUTS & TRAINING RUNS
-# -------------------------------
+data/yolo_cards_single/
+data/yolo_cards_single/images/
+data/yolo_cards_single/images/train/
+data/yolo_cards_single/images/val/
+data/yolo_cards_single/labels/
+data/yolo_cards_single/labels/train/
+data/yolo_cards_single/labels/val/ 
+
+# Do NOT ignore raw_cards or backgrounds (these are source assets)
+!data/raw_cards/
+!data/backgrounds/
+
+# -----------------------------
+# YOLO / Ultralytics outputs
+# -----------------------------
 runs/
-weights/
 *.pt
 *.onnx
 *.engine
+*.trt
+*.torchscript
 *.mlmodel
-*.tflite
 
-# -------------------------------
-# 📦 CACHE / TEMP FILES
-# -------------------------------
-__cache__/
-*.bak
-*.old
-*.swp
-*.swo
-*.zip
-*.tar
-*.gz
+# -----------------------------
+# Cache / artifacts
+# -----------------------------
+*.cache
+*.DS_Store
+*.thumb
+*.tmp
 
-# -------------------------------
-# 💻 OS FILES
-# -------------------------------
-.DS_Store
-Thumbs.db
-desktop.ini
+# -----------------------------
+# Model weights
+# -----------------------------
+weights/
+!weights/README.md
+
+# -----------------------------
+# Ignore heavy SAM weights except those explicitly kept
+# -----------------------------
+sam_vit*.pth
+

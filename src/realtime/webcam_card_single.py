@@ -8,23 +8,13 @@ import torch
 from ultralytics import YOLO
 
 # --- defaults (can be overridden by CLI) ---
-DEFAULT_MODEL = "runs/detect/train3/weights/best.pt"  # single-class 'card' detector
+DEFAULT_MODEL = "runs/detect/train/weights/best.pt" # single-class 'card' detector
 DEFAULT_SOURCE = 0
 DEFAULT_CONF = 0.25
 DEFAULT_IMG_SZ = 704          # ↑ slightly bigger improves small/partial cards
 IOU_MATCH_THRESHOLD = 0.40    # your tracker threshold (kept)
 SMOOTH_FRAMES = 15            # your temporal smoothing (kept)
 FPS_SMOOTH_ALPHA = 0.1
-
-def iou_xyxy(a, b):
-    # boxes: [x1,y1,x2,y2]
-    xA = max(a[0], b[0]); yA = max(a[1], b[1])
-    xB = min(a[2], b[2]); yB = min(a[3], b[3])
-    inter = max(0, xB - xA) * max(0, yB - yA)
-    areaA = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    areaB = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    denom = areaA + areaB - inter
-    return inter / denom if denom > 0 else 0.0
 
 def refine_bbox_with_edges(frame, box, pad=8):
     # box: [x1,y1,x2,y2], returns (ok, refined_box)
@@ -53,12 +43,10 @@ def refine_bbox_with_edges(frame, box, pad=8):
     (cx, cy), (w, h), ang = rect
     w, h = max(w,1), max(h,1)
     ratio = max(w, h) / max(1.0, min(w, h))
+    if ratio < 1.2 or ratio > 1.8:
+        return False, box  # not card-like
 
-    # card-like aspect after rotation (loose range, adjust if needed)
-    if ratio < 1.2 or ratio > 2.0:
-        return False, box
-
-    box_pts = cv2.boxPoints(rect)  # 4x2
+    box_pts = cv2.boxPoints(rect)
     box_pts[:,0] += x1; box_pts[:,1] += y1
     xA, yA = np.min(box_pts, axis=0).astype(int)
     xB, yB = np.max(box_pts, axis=0).astype(int)
@@ -67,6 +55,15 @@ def refine_bbox_with_edges(frame, box, pad=8):
         return False, box
     return True, np.array([xA, yA, xB, yB], dtype=float)
 
+def iou_xyxy(a, b):
+    # boxes: [x1,y1,x2,y2]
+    xA = max(a[0], b[0]); yA = max(a[1], b[1])
+    xB = min(a[2], b[2]); yB = min(a[3], b[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    areaA = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    areaB = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    denom = areaA + areaB - inter
+    return inter / denom if denom > 0 else 0.0
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
