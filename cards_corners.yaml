@@ -1,8 +1,13 @@
-path: ./data/yolo_cards_seg
+# cards_corners.yaml
 
-train: images/train
-val: images/val
+# root of the corners dataset
+path: ./data/yolo_cards_corners
 
+# no subfolders yet → use the root images folder for both
+train: images
+val: images
+
+# 52 classes in the SAME order as LABEL_ORDER in generate_dataset.py
 names:
   0: 2C
   1: 2D

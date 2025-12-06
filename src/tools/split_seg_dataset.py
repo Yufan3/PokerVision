@@ -3,7 +3,7 @@ import random
 import shutil
 
 def main():
-    base = Path("data/yolo_cards_seg")
+    base = Path("data/yolo_cards_corners")
     images_dir = base / "images"
     labels_dir = base / "labels"
 

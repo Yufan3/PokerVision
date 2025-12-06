@@ -122,14 +122,17 @@ def shift_placements_inside(placements, W, H, margin=2):
 
     if abs(dx) < 1e-6 and abs(dy) < 1e-6:
         return placements
-
+    
     for p in placements:
         x1, y1, x2, y2 = p["bbox"]
         p["bbox"] = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
-        if "tl_quad" in p and p["tl_quad"] is not None:
-            p["tl_quad"] = [(px + dx, py + dy) for (px, py) in p["tl_quad"]]
-        if "br_quad" in p and p["br_quad"] is not None:
-            p["br_quad"] = [(px + dx, py + dy) for (px, py) in p["br_quad"]]
+        if "tl_box" in p and p["tl_box"] is not None:
+            px1, py1, px2, py2 = p["tl_box"]
+            p["tl_box"] = (px1 + dx, py1 + dy, px2 + dx, py2 + dy)
+        if "br_box" in p and p["br_box"] is not None:
+            px1, py1, px2, py2 = p["br_box"]
+            p["br_box"] = (px1 + dx, py1 + dy, px2 + dx, py2 + dy)
+
 
     return placements
 
@@ -206,9 +209,9 @@ def draw_fake_occluders(bg_img, num_shapes=3):
 
         if random.random() < 0.5:
             color = (
-                random.randint(10, 40),
-                random.randint(10, 40),
-                random.randint(10, 40),
+                random.randint(10, 50),
+                random.randint(10, 50),
+                random.randint(10, 50),
             )
         else:
             color = (
@@ -217,7 +220,7 @@ def draw_fake_occluders(bg_img, num_shapes=3):
                 random.randint(100, 180),
             )
 
-        shape_type = random.choice(["rect", "ellipse"])
+        shape_type = random.choice(["rect"])
         if shape_type == "rect":
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=-1)
         else:
@@ -248,85 +251,100 @@ def _available_classes(card_variants):
     ]
 
 
-def _compute_corner_quads(new_w, new_h, angle_deg, xmin, ymin):
+# -----------------------
+# Corner bbox via mask-rotation  (robust, matches PIL exactly)
+# -----------------------
+
+def _compute_corner_bboxes(new_w, new_h, angle_deg, xmin, ymin):
     """
-    Given card size, rotation (degrees), and top-left placement (xmin, ymin)
-    of the *rotated* card image, compute global TL/BR corner quads.
+    Compute TL/BR corner bounding boxes in GLOBAL coords.
 
-    Corner regions are defined in card-local coords, then rotated using
-    the same transform as PIL.rotate(..., expand=True), then shifted by (xmin, ymin).
+    Steps:
+      1) Create binary masks for TL/BR corner rectangles in the *unrotated* card.
+      2) Rotate each mask with the same PIL.rotate(angle, expand=True).
+      3) From each rotated mask, read the bbox (in rotated-card coords).
+      4) Shift by (xmin, ymin) to get global coords.
+    Returns:
+      tl_box, br_box where each is (x1, y1, x2, y2) or None.
     """
 
-    # --- 1) define corner rectangles in card-local coords ---
-    # You can tweak these fractions if you want slightly bigger / smaller patches.
-    tl_w_frac, tl_h_frac = 0.20, 0.286
-    br_w_frac, br_h_frac = 0.20, 0.286
+    # ---- define corner rectangles in unrotated card coords ----
+    # Tighter fractions so boxes hug the rank+suit cluster more closely.
+    tl_margin_x_frac = 0.030   # a bit more margin from edge
+    tl_margin_y_frac = 0.032
+    tl_w_frac        = 0.14   # narrower
+    tl_h_frac        = 0.24   # shorter
 
-    tl_w = tl_w_frac * new_w
-    tl_h = tl_h_frac * new_h
+    br_margin_x_frac = 0.030
+    br_margin_y_frac = 0.032
+    br_w_frac        = 0.14
+    br_h_frac        = 0.24
 
-    br_w = br_w_frac * new_w
-    br_h = br_h_frac * new_h
+    tl_x0 = int(round(tl_margin_x_frac * new_w))
+    tl_y0 = int(round(tl_margin_y_frac * new_h))
+    tl_x1 = int(round(tl_x0 + tl_w_frac * new_w))
+    tl_y1 = int(round(tl_y0 + tl_h_frac * new_h))
 
-    tl_local = np.array([
-        [0.0,    0.0   ],
-        [tl_w,   0.0   ],
-        [tl_w,   tl_h  ],
-        [0.0,    tl_h  ],
-    ], dtype=np.float32)
+    br_x1 = int(round(new_w - br_margin_x_frac * new_w))
+    br_y1 = int(round(new_h - br_margin_y_frac * new_h))
+    br_x0 = int(round(br_x1 - br_w_frac * new_w))
+    br_y0 = int(round(br_y1 - br_h_frac * new_h))
 
-    br_local = np.array([
-        [new_w - br_w, new_h - br_h],
-        [new_w,        new_h - br_h],
-        [new_w,        new_h       ],
-        [new_w - br_w, new_h       ],
-    ], dtype=np.float32)
+    # clamp inside card
+    tl_x0, tl_y0 = max(tl_x0, 0), max(tl_y0, 0)
+    tl_x1, tl_y1 = min(tl_x1, new_w), min(tl_y1, new_h)
+    br_x0, br_y0 = max(br_x0, 0), max(br_y0, 0)
+    br_x1, br_y1 = min(br_x1, new_w), min(br_y1, new_h)
 
-    # --- 2) build the same rotation/expand transform as PIL ---
-    full_corners = np.array([
-        [0.0,   0.0   ],
-        [new_w, 0.0   ],
-        [new_w, new_h ],
-        [0.0,   new_h ],
-    ], dtype=np.float32)
+    tl_mask = np.zeros((new_h, new_w), dtype=np.uint8)
+    br_mask = np.zeros((new_h, new_w), dtype=np.uint8)
 
-    cx = new_w / 2.0
-    cy = new_h / 2.0
+    if tl_x1 > tl_x0 and tl_y1 > tl_y0:
+        tl_mask[tl_y0:tl_y1, tl_x0:tl_x1] = 255
+    if br_x1 > br_x0 and br_y1 > br_y0:
+        br_mask[br_y0:br_y1, br_x0:br_x1] = 255
 
-    theta = math.radians(angle_deg)
-    c, s = math.cos(theta), math.sin(theta)
-    R = np.array([[c, -s],
-                  [s,  c]], dtype=np.float32)
+    angle = float(angle_deg)
+    tl_mask_rot = Image.fromarray(tl_mask).rotate(angle, expand=True)
+    br_mask_rot = Image.fromarray(br_mask).rotate(angle, expand=True)
 
-    # rotate full card to find min_xy (for expand=True)
-    shifted_full = full_corners - np.array([[cx, cy]], dtype=np.float32)
-    rotated_full = shifted_full @ R.T + np.array([[cx, cy]], dtype=np.float32)
-    min_xy = rotated_full.min(axis=0, keepdims=True)
+    tl_mask_rot_np = np.array(tl_mask_rot)
+    br_mask_rot_np = np.array(br_mask_rot)
 
-    def rot_local_pts(pts_local):
-        shifted = pts_local - np.array([[cx, cy]], dtype=np.float32)
-        rot = shifted @ R.T + np.array([[cx, cy]], dtype=np.float32)
-        rot -= min_xy  # top-left of rotated card at (0,0)
-        return rot
+    def mask_to_box(mask_np):
+        ys, xs = np.where(mask_np > 0)
+        if xs.size == 0 or ys.size == 0:
+            return None
+        x1 = xs.min()
+        y1 = ys.min()
+        x2 = xs.max()
+        y2 = ys.max()
+        return x1, y1, x2, y2
 
-    tl_rot = rot_local_pts(tl_local)
-    br_rot = rot_local_pts(br_local)
+    tl_local_box = mask_to_box(tl_mask_rot_np)
+    br_local_box = mask_to_box(br_mask_rot_np)
 
-    # --- 3) shift into global image coords ---
-    tl_global = [(float(px + xmin), float(py + ymin)) for (px, py) in tl_rot]
-    br_global = [(float(px + xmin), float(py + ymin)) for (px, py) in br_rot]
+    def to_global(local_box):
+        if local_box is None:
+            return None
+        x1, y1, x2, y2 = local_box
+        return float(x1 + xmin), float(y1 + ymin), float(x2 + xmin), float(y2 + ymin)
 
-    return tl_global, br_global
+    tl_box_global = to_global(tl_local_box)
+    br_box_global = to_global(br_local_box)
+
+    return tl_box_global, br_box_global
+
 
 
 def hard_fan_instances(card_variants, W, H):
     placements = []
 
     available_classes = _available_classes(card_variants)
-    if not available_classes:
+    if len(available_classes) == 0:
         return placements
 
-    k = random.randint(3, 6)
+    k = random.randint(3, 5)
     chosen_classes = random.sample(available_classes, k=min(k, len(available_classes)))
 
     base_images = []
@@ -337,59 +355,89 @@ def hard_fan_instances(card_variants, W, H):
     if any(img is None for img in base_images):
         return placements
 
-    base_card_width = base_images[0].size[0]
-    scale_base = (W / base_card_width) * 0.22
-    scale_factor = random.uniform(1.0, 1.4)
-    scale = scale_base * scale_factor
+    fan_frac_min = 0.18
+    fan_frac_max = 0.22
+    fan_width_fraction = random.uniform(fan_frac_min, fan_frac_max)
+    target_card_w = int(W * fan_width_fraction)
 
-    start_angle = random.uniform(-40, 40)
-    step_deg = random.uniform(4, 8)
+    # fan geometry
+    start_angle = random.uniform(-30, 30)
+    step_deg = random.uniform(9, 12)
 
-    anchor_x = random.randint(int(0.50 * W), int(0.90 * W))
-    anchor_y = random.randint(int(0.76 * H), int(0.90 * H))
+    anchor_x = random.randint(int(0.35 * W), int(0.65 * W))
+    anchor_y = random.randint(int(0.45 * H), int(0.80 * H))
 
     for i, (cls, img_raw) in enumerate(zip(chosen_classes, base_images)):
         orig_w, orig_h = img_raw.size
         if orig_w == 0 or orig_h == 0:
             continue
 
-        new_w = int(orig_w * scale)
+        # resize card
+        scale = target_card_w / float(orig_w)
+        new_w = target_card_w
         new_h = int(orig_h * scale)
         card_img = img_raw.resize((new_w, new_h), Image.BICUBIC)
 
         angle = start_angle - i * step_deg
 
-        # compute rotated full-card corners to get "grip" in rotated coords
-        whole_rot = _rotate_full_card(new_w, new_h, angle)
-        rot_w = whole_rot[:, 0].max() - whole_rot[:, 0].min()
-        rot_h = whole_rot[:, 1].max() - whole_rot[:, 1].min()
+        # ---- build rotation transform matching PIL.rotate(expand=True) ----
+        full_corners = np.array([
+            [0.0,   0.0],
+            [new_w, 0.0],
+            [new_w, new_h],
+            [0.0,   new_h],
+        ], dtype=np.float32)
 
+        cx = new_w / 2.0
+        cy = new_h / 2.0
+
+        theta = math.radians(-angle)
+        c, s = math.cos(theta), math.sin(theta)
+        R = np.array([[c, -s],
+                      [s,  c]], dtype=np.float32)
+
+        # rotate full card to get min_xy (for expand=True)
+        shifted_full = full_corners - np.array([[cx, cy]], dtype=np.float32)
+        rotated_full = shifted_full @ R.T + np.array([[cx, cy]], dtype=np.float32)
+        min_xy = rotated_full.min(axis=0, keepdims=True)
+
+        # size of rotated card
+        rotated_full -= min_xy
+        rot_w = float(rotated_full[:, 0].max())
+        rot_h = float(rotated_full[:, 1].max())
+
+        # rotate the *grip point* at (0.6, 0.75) in local card coords
+        grip_local = np.array([[0.65 * new_w, 0.8 * new_h]], dtype=np.float32)
+        shifted_grip = grip_local - np.array([[cx, cy]], dtype=np.float32)
+        rotated_grip = shifted_grip @ R.T + np.array([[cx, cy]], dtype=np.float32)
+        rotated_grip -= min_xy
+        grip_rot_x, grip_rot_y = float(rotated_grip[0, 0]), float(rotated_grip[0, 1])
+
+        # actually rotate the image with PIL
         rotated = card_img.rotate(angle, expand=True)
-        rot_w, rot_h = rotated.size  # ensures consistency with PIL
+        # (rot_w, rot_h) should match rotated.size; enforce that
+        rot_w, rot_h = rotated.size
 
-        # grip = bottom-right vertex in rotated coords
-        xs = whole_rot[:, 0]
-        ys = whole_rot[:, 1]
-        br_idx = np.argmax(xs + ys)
-        grip_rot_x, grip_rot_y = whole_rot[br_idx]
-
+        # back cards slightly shifted from the front around grip point
         dist_from_front = (k - 1) - i
-        fan_offset_x = -dist_from_front * (0.10 * new_w)
-        fan_offset_y = -dist_from_front * (0.04 * new_h)
+        fan_offset_x = -dist_from_front * (0.04 * new_w)
+        fan_offset_y = -dist_from_front * (0.03 * new_h)
 
+        # place so that rotated grip sits at anchor + offset
         xmin = int(anchor_x + fan_offset_x - grip_rot_x)
         ymin = int(anchor_y + fan_offset_y - grip_rot_y)
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
+        # compute TL/BR corner boxes in global coords
+        tl_box, br_box = _compute_corner_bboxes(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
             "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "tl_quad": tl_quad,
-            "br_quad": br_quad,
+            "tl_box": tl_box,
+            "br_box": br_box,
         })
 
     # require fully inside
@@ -425,7 +473,7 @@ def random_single_card_instances(card_variants, W, H, num_cards):
 
         r = random.random()
         if r < 0.35:
-            frac_min, frac_max = 0.20, 0.32
+            frac_min, frac_max = 0.18, 0.30
         else:
             frac_min, frac_max = 0.12, 0.18
 
@@ -450,27 +498,36 @@ def random_single_card_instances(card_variants, W, H, num_cards):
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
+        tl_box, br_box = _compute_corner_bboxes(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
             "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "tl_quad": tl_quad,
-            "br_quad": br_quad,
+            "tl_box": tl_box,
+            "br_box": br_box,
         })
+
 
     return placements
 
 
 def fan_cluster_instances(card_variants, W, H):
+    """
+    Create a realistic fan of cards where all cards share a common grip point
+    around (0.6, 0.75) in card-local coordinates (TL=(0,0), BR=(1,1)).
+
+    The grip point is rotated with the same transform as the card image
+    (PIL.rotate(..., expand=True)), then aligned to (anchor_x + fan_offset_x,
+    anchor_y + fan_offset_y) in the global image.
+    """
     placements = []
 
     available_classes = _available_classes(card_variants)
     if len(available_classes) == 0:
         return placements
 
-    k = random.randint(2, 5)
+    k = random.randint(3, 5)
     chosen_classes = random.sample(available_classes, k=min(k, len(available_classes)))
 
     base_images = []
@@ -481,22 +538,24 @@ def fan_cluster_instances(card_variants, W, H):
     if any(img is None for img in base_images):
         return placements
 
-    fan_frac_min = 0.18
-    fan_frac_max = 0.22
+    fan_frac_min = 0.19
+    fan_frac_max = 0.21
     fan_width_fraction = random.uniform(fan_frac_min, fan_frac_max)
     target_card_w = int(W * fan_width_fraction)
 
-    start_angle = random.uniform(-20, 30)
-    step_deg = random.uniform(9, 16)
+    # fan geometry
+    start_angle = random.uniform(-30, 30)
+    step_deg = random.uniform(12, 14)
 
-    anchor_x = random.randint(int(0.45 * W), int(0.85 * W))
-    anchor_y = random.randint(int(0.55 * H), int(0.95 * H))
+    anchor_x = random.randint(int(0.35 * W), int(0.65 * W))
+    anchor_y = random.randint(int(0.45 * H), int(0.80 * H))
 
     for i, (cls, img_raw) in enumerate(zip(chosen_classes, base_images)):
         orig_w, orig_h = img_raw.size
         if orig_w == 0 or orig_h == 0:
             continue
 
+        # resize card
         scale = target_card_w / float(orig_w)
         new_w = target_card_w
         new_h = int(orig_h * scale)
@@ -504,35 +563,67 @@ def fan_cluster_instances(card_variants, W, H):
 
         angle = start_angle - i * step_deg
 
-        whole_rot = _rotate_full_card(new_w, new_h, angle)
+        # ---- build rotation transform matching PIL.rotate(expand=True) ----
+        full_corners = np.array([
+            [0.0,   0.0],
+            [new_w, 0.0],
+            [new_w, new_h],
+            [0.0,   new_h],
+        ], dtype=np.float32)
+
+        cx = new_w / 2.0
+        cy = new_h / 2.0
+
+        theta = math.radians(-angle)
+        c, s = math.cos(theta), math.sin(theta)
+        R = np.array([[c, -s],
+                      [s,  c]], dtype=np.float32)
+
+        # rotate full card to get min_xy (for expand=True)
+        shifted_full = full_corners - np.array([[cx, cy]], dtype=np.float32)
+        rotated_full = shifted_full @ R.T + np.array([[cx, cy]], dtype=np.float32)
+        min_xy = rotated_full.min(axis=0, keepdims=True)
+
+        # size of rotated card
+        rotated_full -= min_xy
+        rot_w = float(rotated_full[:, 0].max())
+        rot_h = float(rotated_full[:, 1].max())
+
+        # rotate the *grip point* at (0.6, 0.75) in local card coords
+        grip_local = np.array([[0.65 * new_w, 0.8 * new_h]], dtype=np.float32)
+        shifted_grip = grip_local - np.array([[cx, cy]], dtype=np.float32)
+        rotated_grip = shifted_grip @ R.T + np.array([[cx, cy]], dtype=np.float32)
+        rotated_grip -= min_xy
+        grip_rot_x, grip_rot_y = float(rotated_grip[0, 0]), float(rotated_grip[0, 1])
+
+        # actually rotate the image with PIL
         rotated = card_img.rotate(angle, expand=True)
+        # (rot_w, rot_h) should match rotated.size; enforce that
         rot_w, rot_h = rotated.size
 
-        # grip = bottom-right in rotated coords
-        xs = whole_rot[:, 0]
-        ys = whole_rot[:, 1]
-        br_idx = np.argmax(xs + ys)
-        grip_rot_x, grip_rot_y = whole_rot[br_idx]
-
+        # back cards slightly shifted from the front around grip point
         dist_from_front = (k - 1) - i
-        fan_offset_x = -dist_from_front * (0.08 * new_w)
+        fan_offset_x = -dist_from_front * (0.04 * new_w)
         fan_offset_y = -dist_from_front * (0.03 * new_h)
 
+        # place so that rotated grip sits at anchor + offset
         xmin = int(anchor_x + fan_offset_x - grip_rot_x)
         ymin = int(anchor_y + fan_offset_y - grip_rot_y)
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
+        # compute TL/BR corner boxes in global coords
+        tl_box, br_box = _compute_corner_bboxes(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
             "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "tl_quad": tl_quad,
-            "br_quad": br_quad,
+            "tl_box": tl_box,
+            "br_box": br_box,
         })
 
+    # require fully inside
     for p in placements:
         x1, y1, x2, y2 = p["bbox"]
         if x1 < 0 or y1 < 0 or x2 > W or y2 > H:
@@ -541,38 +632,18 @@ def fan_cluster_instances(card_variants, W, H):
     placements = shift_placements_inside(placements, W, H)
     return placements
 
-
 # -----------------------
 # Compose & labels
 # -----------------------
 
-def quad_to_bbox_clamped(quad, W, H, min_size=4):
-    """
-    Given a list of 4 (x, y) points in GLOBAL coords, return an axis-aligned
-    bbox (xmin, ymin, xmax, ymax) clamped inside the image [0,W) x [0,H).
-    Returns None if the box is degenerate or too small.
-    """
-    xs = np.array([p[0] for p in quad], dtype=np.float32)
-    ys = np.array([p[1] for p in quad], dtype=np.float32)
-
-    xmin = float(xs.min())
-    xmax = float(xs.max())
-    ymin = float(ys.min())
-    ymax = float(ys.max())
-
-    # clamp to image
-    xmin = max(0.0, min(float(W - 1), xmin))
-    ymin = max(0.0, min(float(H - 1), ymin))
-    xmax = max(0.0, min(float(W - 1), xmax))
-    ymax = max(0.0, min(float(H - 1), ymax))
-
-    if xmax <= xmin or ymax <= ymin:
-        return None
-
-    if (xmax - xmin) < min_size or (ymax - ymin) < min_size:
-        return None
-
-    return xmin, ymin, xmax, ymax
+def _poly_to_mask(H, W, poly):
+    """Rasterize a polygon (list of (x,y)) into a boolean mask."""
+    mask = np.zeros((H, W), dtype=np.uint8)
+    pts = np.round(np.array(poly, dtype=np.float32)).astype(np.int32)
+    if pts.ndim == 2:
+        pts = pts.reshape(-1, 1, 2)
+    cv2.fillPoly(mask, [pts], 1)
+    return mask.astype(bool)
 
 
 def compose_on_background(bg_img, placements):
@@ -581,22 +652,21 @@ def compose_on_background(bg_img, placements):
       composite_bgr: HxWx3 uint8
       annotations:   list of (class_id, xmin, ymin, xmax, ymax)
 
-    - We paste all cards (back->front) using RGBA alpha.
-    - For each card, we use its precomputed corner quads (tl_quad / br_quad)
-      to build tight axis-aligned boxes for TL / BR corner patches.
-
-    NO alpha-based occupancy tricks here: just pure geometry.
-    This guarantees the boxes are glued to the corners for any rotation.
+    Strategy:
+      1) Paste all cards back->front with RGBA alpha.
+      2) Iterate front->back, computing card alpha masks.
+         For each TL/BR box, check how much of it is actually visible
+         (not occluded by cards in front). Only keep boxes where
+         visible_fraction >= MIN_CORNER_FRACTION.
     """
     bg = bg_img.copy()
     W, H = bg.size
 
-    # 1) draw cards back->front in the order they appear
+    # 1) Paste cards back->front
     for p in placements:
         card_img = p["img"]  # PIL RGBA
         xmin, ymin, xmax, ymax = p["bbox"]
 
-        # clip bbox to image
         vis_xmin = max(int(xmin), 0)
         vis_ymin = max(int(ymin), 0)
         vis_xmax = min(int(xmax), W)
@@ -613,27 +683,91 @@ def compose_on_background(bg_img, placements):
         card_visible = card_img.crop((crop_left, crop_top, crop_right, crop_bottom))
         bg.paste(card_visible, (vis_xmin, vis_ymin), card_visible)
 
-    # 2) build corner bboxes from corner quads
+    # 2) Visibility-based corner selection (front->back)
+    occupancy = np.zeros((H, W), dtype=bool)  # pixels already covered by front cards
     annotations = []
 
-    for p in placements:
-        cls = p["cls"]
-        tl_quad = p.get("tl_quad")
-        br_quad = p.get("br_quad")
+    MIN_CORNER_PIXELS   = 30     # absolute minimum area in pixels
+    MIN_CORNER_FRACTION = 0.45   # at least 45% of corner box must be visible
 
-        class_id = LABEL_ORDER.index(cls)  # LABEL_ORDER must match YAML 'names' order
+    for p in reversed(placements):  # front card first
+        cls      = p["cls"]
+        card_img = p["img"]
+        xmin, ymin, xmax, ymax = p["bbox"]
 
-        if tl_quad is not None:
-            bbox = quad_to_bbox_clamped(tl_quad, W, H)
-            if bbox is not None:
-                x1, y1, x2, y2 = bbox
-                annotations.append((class_id, x1, y1, x2, y2))
+        vis_xmin = max(int(xmin), 0)
+        vis_ymin = max(int(ymin), 0)
+        vis_xmax = min(int(xmax), W)
+        vis_ymax = min(int(ymax), H)
 
-        if br_quad is not None:
-            bbox = quad_to_bbox_clamped(br_quad, W, H)
-            if bbox is not None:
-                x1, y1, x2, y2 = bbox
-                annotations.append((class_id, x1, y1, x2, y2))
+        if vis_xmin >= vis_xmax or vis_ymin >= vis_ymax:
+            continue
+
+        crop_left   = vis_xmin - xmin
+        crop_top    = vis_ymin - ymin
+        crop_right  = crop_left + (vis_xmax - vis_xmin)
+        crop_bottom = crop_top  + (vis_ymax - vis_ymin)
+
+        card_visible = card_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        if card_visible.mode != "RGBA":
+            continue
+
+        alpha = np.array(card_visible.split()[-1])
+        mask_local = alpha > 10
+        if not mask_local.any():
+            continue
+
+        h_vis, w_vis = mask_local.shape
+        card_mask_full = np.zeros((H, W), dtype=bool)
+        card_mask_full[vis_ymin:vis_ymin + h_vis,
+                       vis_xmin:vis_xmin + w_vis] = mask_local
+
+        if not card_mask_full.any():
+            continue
+
+        class_id = LABEL_ORDER.index(cls)
+        tl_box = p.get("tl_box")
+        br_box = p.get("br_box")
+
+        def handle_corner(box):
+            if box is None:
+                return
+            x1, y1, x2, y2 = box
+
+            # clamp to image & int
+            x1 = max(0, min(W - 1, int(round(x1))))
+            y1 = max(0, min(H - 1, int(round(y1))))
+            x2 = max(0, min(W - 1, int(round(x2))))
+            y2 = max(0, min(H - 1, int(round(y2))))
+
+            if x2 <= x1 or y2 <= y1:
+                return
+
+            # corner area within this card
+            corner_mask = card_mask_full[y1:y2, x1:x2]
+            full_area = int(corner_mask.sum())
+            if full_area < MIN_CORNER_PIXELS:
+                return
+
+            # visible = not occluded by cards in front
+            visible_mask = corner_mask & (~occupancy[y1:y2, x1:x2])
+            vis_area = int(visible_mask.sum())
+            if vis_area < MIN_CORNER_PIXELS:
+                return
+
+            if vis_area / full_area < MIN_CORNER_FRACTION:
+                return
+
+            # passed visibility checks → keep bbox
+            annotations.append((class_id, float(x1), float(y1),
+                                float(x2), float(y2)))
+
+        # TL & BR
+        handle_corner(tl_box)
+        handle_corner(br_box)
+
+        # mark this whole card as occupied for deeper cards
+        occupancy |= card_mask_full
 
     composite = np.array(bg)[:, :, ::-1]  # RGB -> BGR
     return composite, annotations
@@ -730,7 +864,7 @@ def main():
         print("[FATAL] You have no cards in data/raw_cards/(normal|inverted|real).")
         return
 
-    num_samples = 20  # scale up for real training
+    num_samples = 25  # scale up for real training
     HARD_NEG_PROB = 0.08   # 8% pure clutter/background
     HARD_POS_PROB = 0.25   # 25% hard fans
 
@@ -756,7 +890,7 @@ def main():
 
         # 3) normal mixture
         else:
-            if random.random() < 0.7:
+            if random.random() < 0.75:
                 placements = fan_cluster_instances(card_variants, W, H)
                 extra = random_single_card_instances(card_variants, W, H,
                                                      num_cards=random.randint(0, 2))
