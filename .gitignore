@@ -26,6 +26,7 @@ env/
 # -----------------------------
 # Project: Dataset Generation Output
 # -----------------------------
+data/yolo_cards_corners/
 data/yolo_cards_single/
 data/yolo_cards_seg/
 data/generated/

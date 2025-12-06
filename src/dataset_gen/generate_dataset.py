@@ -11,13 +11,42 @@ from src.utils.config import (
     STYLE_GROUP_DIRS,
     STYLE_WEIGHTS,
     BACKGROUNDS_DIR,
-    IMAGES_DIR,
-    LABELS_DIR,
-    CARD_CLASSES,
+    IMAGES_DIR,   # unused here but kept for compatibility
+    LABELS_DIR,   # unused here but kept for compatibility
+    CARD_CLASSES,  # should be the 52 logical cards: AS, 2S, ..., KH
 )
 
 from src.dataset_gen.yolo_label_utils import bbox_to_yolo
 
+# Fixed label order: rank-major (2..A), suit alphabetical (C, D, H, S)
+LABEL_ORDER = [
+    "2C", "2D", "2H", "2S",
+    "3C", "3D", "3H", "3S",
+    "4C", "4D", "4H", "4S",
+    "5C", "5D", "5H", "5S",
+    "6C", "6D", "6H", "6S",
+    "7C", "7D", "7H", "7S",
+    "8C", "8D", "8H", "8S",
+    "9C", "9D", "9H", "9S",
+    "TC", "TD", "TH", "TS",
+    "JC", "JD", "JH", "JS",
+    "QC", "QD", "QH", "QS",
+    "KC", "KD", "KH", "KS",
+    "AC", "AD", "AH", "AS",
+]
+
+# -----------------------
+# Dataset paths (NEW)
+# -----------------------
+
+CORNER_BASE_DIR = Path("data/yolo_cards_corners")
+CORNER_IMAGES_DIR = CORNER_BASE_DIR / "images"
+CORNER_LABELS_DIR = CORNER_BASE_DIR / "labels"
+
+CORNER_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+CORNER_LABELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# (seg paths kept but unused – safe to leave)
 SEG_BASE_DIR = Path("data/yolo_cards_seg")
 SEG_IMAGES_DIR = SEG_BASE_DIR / "images"
 SEG_LABELS_DIR = SEG_BASE_DIR / "labels"
@@ -25,21 +54,22 @@ SEG_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 SEG_LABELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def compute_rotated_quad(new_w, new_h, angle_deg):
-    """
-    Compute the 4 corner coordinates of a rectangle of size (new_w, new_h)
-    after rotation by angle_deg (in degrees) around its center, assuming
-    PIL's rotate(expand=True) semantics: the rotated rectangle is placed
-    in a new canvas whose top-left is at (0, 0).
+# -----------------------
+# Geometry helpers
+# -----------------------
 
-    Returns a (4, 2) array of (x, y) in the rotated-image coordinate system.
-    Order: [top-left, top-right, bottom-right, bottom-left] (approximately).
+def _rotate_full_card(new_w, new_h, angle_deg):
     """
-    corners = np.array([
-        [0,         0        ],  # TL
-        [new_w,     0        ],  # TR
-        [new_w,     new_h    ],  # BR
-        [0,         new_h    ],  # BL
+    Return the 4 card corners after rotation with expand=True,
+    in the rotated-image coordinate system (top-left at 0,0).
+    Order is the same as input:
+      [ [0,0], [new_w,0], [new_w,new_h], [0,new_h] ] -> rotated
+    """
+    full_corners = np.array([
+        [0.0,   0.0   ],
+        [new_w, 0.0   ],
+        [new_w, new_h ],
+        [0.0,   new_h ],
     ], dtype=np.float32)
 
     cx = new_w / 2.0
@@ -50,34 +80,21 @@ def compute_rotated_quad(new_w, new_h, angle_deg):
     R = np.array([[c, -s],
                   [s,  c]], dtype=np.float32)
 
-    shifted = corners - np.array([[cx, cy]], dtype=np.float32)
-    rotated = shifted @ R.T + np.array([[cx, cy]], dtype=np.float32)
+    shifted_full = full_corners - np.array([[cx, cy]], dtype=np.float32)
+    rotated_full = shifted_full @ R.T + np.array([[cx, cy]], dtype=np.float32)
 
-    # simulate expand=True canvas: shift so that min coords are at (0,0)
-    min_xy = rotated.min(axis=0, keepdims=True)
-    rotated -= min_xy
+    min_xy = rotated_full.min(axis=0, keepdims=True)
+    rotated_full -= min_xy  # emulate expand=True placing top-left at (0,0)
 
-    # reorder approximately TL, TR, BR, BL by y then x
-    ys = rotated[:, 1]
-    xs = rotated[:, 0]
-    idx_top = np.argsort(ys)[:2]
-    idx_bottom = np.argsort(ys)[2:]
+    return rotated_full  # (4, 2)
 
-    top = rotated[idx_top]
-    bottom = rotated[idx_bottom]
-
-    top = top[np.argsort(top[:, 0])]       # left, right
-    bottom = bottom[np.argsort(bottom[:, 0])]
-
-    ordered = np.vstack([top, bottom[::-1]])  # TL, TR, BR, BL
-    return ordered
 
 def shift_placements_inside(placements, W, H, margin=2):
     """
     Shift a list of placements so that all bboxes lie fully inside [0, W] x [0, H].
     Each placement has:
         "bbox": (xmin, ymin, xmax, ymax)
-        "poly": [(x, y), ...]  in global coordinates (if present).
+        "tl_quad"/"br_quad": [(x, y), ...]  in global coordinates (if present).
     """
     if not placements:
         return placements
@@ -87,7 +104,6 @@ def shift_placements_inside(placements, W, H, margin=2):
     max_x = max(p["bbox"][2] for p in placements)
     max_y = max(p["bbox"][3] for p in placements)
 
-    # If the fan is literally larger than the image, we just skip shifting.
     if max_x - min_x > W - 2 * margin or max_y - min_y > H - 2 * margin:
         return placements
 
@@ -110,31 +126,19 @@ def shift_placements_inside(placements, W, H, margin=2):
     for p in placements:
         x1, y1, x2, y2 = p["bbox"]
         p["bbox"] = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
-        if "poly" in p and p["poly"] is not None:
-            p["poly"] = [(px + dx, py + dy) for (px, py) in p["poly"]]
+        if "tl_quad" in p and p["tl_quad"] is not None:
+            p["tl_quad"] = [(px + dx, py + dy) for (px, py) in p["tl_quad"]]
+        if "br_quad" in p and p["br_quad"] is not None:
+            p["br_quad"] = [(px + dx, py + dy) for (px, py) in p["br_quad"]]
 
     return placements
+
 
 # -----------------------
 # Helpers to load assets
 # -----------------------
 
 def load_card_variants():
-    """
-    Build a dict of the form:
-
-        {
-          "AS": {
-             "normal":   [PIL.Image, ...],
-             "inverted": [PIL.Image, ...],
-             "real":     [PIL.Image, ...],
-          },
-          "2D": {...},
-          ...
-        }
-
-    using STYLE_GROUP_DIRS from config.py
-    """
     style_names = list(STYLE_GROUP_DIRS.keys())
     variants = {
         cls: {style: [] for style in style_names}
@@ -149,47 +153,31 @@ def load_card_variants():
                     img = Image.open(candidate).convert("RGBA")
                     variants[cls][style].append(img)
 
-    # Warn if any card is completely missing
     for cls, style_dict in variants.items():
         if all(len(imgs) == 0 for imgs in style_dict.values()):
             print(f"[WARN] No variants found for {cls}")
 
     return variants
 
-def choose_card_image(card_variants_for_cls):
-    """
-    card_variants_for_cls is a dict like:
-        {"normal": [imgs...], "inverted": [...], "real": [...]}
 
-    We sample a style according to STYLE_WEIGHTS (normalized over
-    available styles that actually have images), then pick a random
-    image from that style.
-    """
-    # Keep only styles that actually have at least 1 image
+def choose_card_image(card_variants_for_cls):
     available_styles = [
         s for s, imgs in card_variants_for_cls.items()
         if len(imgs) > 0
     ]
     if not available_styles:
-        return None  # caller should handle this
+        return None
 
-    # Build weights for the available styles
     weights = [STYLE_WEIGHTS.get(s, 0.0) for s in available_styles]
     if sum(weights) <= 0:
-        # fallback: uniform if all weights are zero
         weights = [1.0] * len(available_styles)
 
-    # Sample style according to the desired probability
     style_choice = random.choices(available_styles, weights=weights, k=1)[0]
-
-    # Random image within that style
     img = random.choice(card_variants_for_cls[style_choice]).copy()
     return img
 
+
 def load_backgrounds():
-    """
-    Load possible table / desk / felt / etc. backgrounds from data/backgrounds/.
-    """
     backgrounds = []
     for bg_path in BACKGROUNDS_DIR.iterdir():
         if bg_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
@@ -202,17 +190,13 @@ def load_backgrounds():
         print("[ERROR] No backgrounds found in data/backgrounds/")
     return backgrounds
 
+
 def draw_fake_occluders(bg_img, num_shapes=3):
-    """
-    Draw random rectangles/ellipses that vaguely resemble hands/phones etc.
-    This teaches YOLO 'not-card' patterns.
-    """
     bg = bg_img.copy()
     W, H = bg.size
     img = np.array(bg)
 
     for _ in range(num_shapes):
-        # random position and size
         w = random.randint(int(0.05 * W), int(0.25 * W))
         h = random.randint(int(0.05 * H), int(0.25 * H))
         x1 = random.randint(0, max(0, W - w))
@@ -220,23 +204,19 @@ def draw_fake_occluders(bg_img, num_shapes=3):
         x2 = x1 + w
         y2 = y1 + h
 
-        # choose a 'phone-like' or 'hand-like' color
         if random.random() < 0.5:
-            # dark gray / black-ish (phone, wallet, etc.)
             color = (
                 random.randint(10, 40),
                 random.randint(10, 40),
                 random.randint(10, 40),
             )
         else:
-            # skin-ish tone
             color = (
                 random.randint(150, 220),
                 random.randint(130, 200),
                 random.randint(100, 180),
             )
 
-        # rectangle or ellipse
         shape_type = random.choice(["rect", "ellipse"])
         if shape_type == "rect":
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=-1)
@@ -249,61 +229,124 @@ def draw_fake_occluders(bg_img, num_shapes=3):
     out = Image.fromarray(img)
     return out
 
+
 def make_hard_negative_example(backgrounds):
-    """
-    Build a 'no cards' image that still looks card-ish:
-    - background + fake occluder shapes
-    - returns img_bgr, empty_annotations
-    """
     bg_img = random.choice(backgrounds)
     img_with_shapes = draw_fake_occluders(bg_img, num_shapes=random.randint(2, 6))
     img_bgr = np.array(img_with_shapes)[:, :, ::-1]  # RGB->BGR
-    annotations = []  # NO labels => hard negative
-    return img_bgr, annotations
+    return img_bgr
 
-def hard_fan_instances(card_variants, W, H):
-    """
-    A harder version of fan_cluster_instances:
-    - tighter angles (cards almost parallel)
-    - more cards
-    - fans near edges / partially off-frame
-    """
-    placements = []
 
-    # only keep card classes that actually have at least one image
-    available_classes = [
+# -----------------------
+# Card placement routines
+# -----------------------
+
+def _available_classes(card_variants):
+    return [
         cls for cls, style_dict in card_variants.items()
         if any(len(imgs) > 0 for imgs in style_dict.values())
     ]
+
+
+def _compute_corner_quads(new_w, new_h, angle_deg, xmin, ymin):
+    """
+    Given card size, rotation (degrees), and top-left placement (xmin, ymin)
+    of the *rotated* card image, compute global TL/BR corner quads.
+
+    Corner regions are defined in card-local coords, then rotated using
+    the same transform as PIL.rotate(..., expand=True), then shifted by (xmin, ymin).
+    """
+
+    # --- 1) define corner rectangles in card-local coords ---
+    # You can tweak these fractions if you want slightly bigger / smaller patches.
+    tl_w_frac, tl_h_frac = 0.20, 0.286
+    br_w_frac, br_h_frac = 0.20, 0.286
+
+    tl_w = tl_w_frac * new_w
+    tl_h = tl_h_frac * new_h
+
+    br_w = br_w_frac * new_w
+    br_h = br_h_frac * new_h
+
+    tl_local = np.array([
+        [0.0,    0.0   ],
+        [tl_w,   0.0   ],
+        [tl_w,   tl_h  ],
+        [0.0,    tl_h  ],
+    ], dtype=np.float32)
+
+    br_local = np.array([
+        [new_w - br_w, new_h - br_h],
+        [new_w,        new_h - br_h],
+        [new_w,        new_h       ],
+        [new_w - br_w, new_h       ],
+    ], dtype=np.float32)
+
+    # --- 2) build the same rotation/expand transform as PIL ---
+    full_corners = np.array([
+        [0.0,   0.0   ],
+        [new_w, 0.0   ],
+        [new_w, new_h ],
+        [0.0,   new_h ],
+    ], dtype=np.float32)
+
+    cx = new_w / 2.0
+    cy = new_h / 2.0
+
+    theta = math.radians(angle_deg)
+    c, s = math.cos(theta), math.sin(theta)
+    R = np.array([[c, -s],
+                  [s,  c]], dtype=np.float32)
+
+    # rotate full card to find min_xy (for expand=True)
+    shifted_full = full_corners - np.array([[cx, cy]], dtype=np.float32)
+    rotated_full = shifted_full @ R.T + np.array([[cx, cy]], dtype=np.float32)
+    min_xy = rotated_full.min(axis=0, keepdims=True)
+
+    def rot_local_pts(pts_local):
+        shifted = pts_local - np.array([[cx, cy]], dtype=np.float32)
+        rot = shifted @ R.T + np.array([[cx, cy]], dtype=np.float32)
+        rot -= min_xy  # top-left of rotated card at (0,0)
+        return rot
+
+    tl_rot = rot_local_pts(tl_local)
+    br_rot = rot_local_pts(br_local)
+
+    # --- 3) shift into global image coords ---
+    tl_global = [(float(px + xmin), float(py + ymin)) for (px, py) in tl_rot]
+    br_global = [(float(px + xmin), float(py + ymin)) for (px, py) in br_rot]
+
+    return tl_global, br_global
+
+
+def hard_fan_instances(card_variants, W, H):
+    placements = []
+
+    available_classes = _available_classes(card_variants)
     if not available_classes:
         return placements
 
-    # 3–6 cards in a tight fan
     k = random.randint(3, 6)
     chosen_classes = random.sample(available_classes, k=min(k, len(available_classes)))
 
-    # pick one image for each class using style weights
     base_images = []
     for c in chosen_classes:
         img = choose_card_image(card_variants[c])
         base_images.append(img)
 
-    # if any class had no available image, bail out
     if any(img is None for img in base_images):
         return placements
 
-    # base scale
     base_card_width = base_images[0].size[0]
-    scale_base = (W / base_card_width) * 0.22  # slightly larger than normal fan
+    scale_base = (W / base_card_width) * 0.22
     scale_factor = random.uniform(1.0, 1.4)
     scale = scale_base * scale_factor
 
-    start_angle = random.uniform(-10, 10)   # cards almost vertical
-    step_deg    = random.uniform(4, 8)      # very tight spread
+    start_angle = random.uniform(-40, 40)
+    step_deg = random.uniform(4, 8)
 
-    # anchor somewhere where part of the fan may fall outside frame
-    anchor_x = random.randint(int(0.4 * W), int(0.95 * W))
-    anchor_y = random.randint(int(0.4 * H), int(0.95 * H))
+    anchor_x = random.randint(int(0.50 * W), int(0.90 * W))
+    anchor_y = random.randint(int(0.76 * H), int(0.90 * H))
 
     for i, (cls, img_raw) in enumerate(zip(chosen_classes, base_images)):
         orig_w, orig_h = img_raw.size
@@ -316,70 +359,53 @@ def hard_fan_instances(card_variants, W, H):
 
         angle = start_angle - i * step_deg
 
-        # 1) get rotated quad in the SAME coords as the rotated image (expand=True)
-        quad_local = compute_rotated_quad(new_w, new_h, angle)
+        # compute rotated full-card corners to get "grip" in rotated coords
+        whole_rot = _rotate_full_card(new_w, new_h, angle)
+        rot_w = whole_rot[:, 0].max() - whole_rot[:, 0].min()
+        rot_h = whole_rot[:, 1].max() - whole_rot[:, 1].min()
 
-        # 2) rotate the image with expand=True (same transform as in quad_local)
         rotated = card_img.rotate(angle, expand=True)
-        rot_w, rot_h = rotated.size
+        rot_w, rot_h = rotated.size  # ensures consistency with PIL
 
-        # 3) choose the "grip" point as the bottom-right vertex of the quad
-        #    (compute_rotated_quad returns approx [TL, TR, BR, BL])
-        grip_rot_x, grip_rot_y = quad_local[2]
+        # grip = bottom-right vertex in rotated coords
+        xs = whole_rot[:, 0]
+        ys = whole_rot[:, 1]
+        br_idx = np.argmax(xs + ys)
+        grip_rot_x, grip_rot_y = whole_rot[br_idx]
 
-        # 4) overlap offsets so earlier cards are pushed left/up
         dist_from_front = (k - 1) - i
         fan_offset_x = -dist_from_front * (0.10 * new_w)
         fan_offset_y = -dist_from_front * (0.04 * new_h)
 
         xmin = int(anchor_x + fan_offset_x - grip_rot_x)
         ymin = int(anchor_y + fan_offset_y - grip_rot_y)
-
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        poly_global = [(float(px + xmin), float(py + ymin)) for (px, py) in quad_local]
+        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
             "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "poly": poly_global,
+            "tl_quad": tl_quad,
+            "br_quad": br_quad,
         })
 
-    # keep this fan only if all its cards are fully inside the background
+    # require fully inside
     for p in placements:
         x1, y1, x2, y2 = p["bbox"]
         if x1 < 0 or y1 < 0 or x2 > W or y2 > H:
-            # discard this entire fan – we'll just not use it
             return []
 
-    # shift whole fan so all cards are fully inside the image
     placements = shift_placements_inside(placements, W, H)
-
     return placements
 
-# -----------------------
-# Card placement routines
-# -----------------------
 
 def random_single_card_instances(card_variants, W, H, num_cards):
-    """
-    Return a list of card placements, where each placement is:
-    {
-       "cls": "AS",
-       "img": PIL.Image (already rotated+scaled),
-       "bbox": (xmin, ymin, xmax, ymax) BEFORE clipping,
-    }
-    For normal table scattering mode.
-    """
     placements = []
 
-    available_classes = [
-    cls for cls, style_dict in card_variants.items()
-    if any(len(imgs) > 0 for imgs in style_dict.values())
-    ]
-
+    available_classes = _available_classes(card_variants)
     if len(available_classes) == 0:
         return placements
 
@@ -389,7 +415,6 @@ def random_single_card_instances(card_variants, W, H, num_cards):
     )
 
     for cls in chosen_classes:
-        # pick style with desired probabilities
         base_img = choose_card_image(card_variants[cls])
         if base_img is None:
             continue
@@ -398,80 +423,53 @@ def random_single_card_instances(card_variants, W, H, num_cards):
         if orig_w == 0 or orig_h == 0:
             continue
 
-        # Decide how big this card should be RELATIVE to the background.
-        # Keep two modes:
-        #   - normal cards: smaller
-        #   - zoomed-in cards: a bit larger, but never crazy big
         r = random.random()
         if r < 0.35:
-            # "zoomed-in" single card
-            frac_min, frac_max = 0.20, 0.32   # % of background width
+            frac_min, frac_max = 0.20, 0.32
         else:
-            # normal single card
-            frac_min, frac_max = 0.12, 0.18   # % of background width
+            frac_min, frac_max = 0.12, 0.18
 
         target_frac = random.uniform(frac_min, frac_max)
         target_w = int(W * target_frac)
 
-        # Resize to this target width, preserving aspect ratio
         scale = target_w / float(orig_w)
         new_w = target_w
         new_h = int(orig_h * scale)
 
         card_img = base_img.resize((new_w, new_h), Image.BICUBIC)
-
-        # rotation
         angle = random.uniform(-90, 90)
 
-        # compute rotated quad in local (rotated image) coords
-        quad_local = compute_rotated_quad(new_w, new_h, angle)
+        rotated = card_img.rotate(angle, expand=True)
+        rot_w, rot_h = rotated.size
 
-        # actual image rotation
-        card_img = card_img.rotate(angle, expand=True)
-        rot_w, rot_h = card_img.size
-
-        # 🔒 Require this card to fit completely inside the background
         if rot_w >= W or rot_h >= H:
-            # card would be larger than the whole image – skip this one
             continue
 
-        # sample a position such that the rotated card is fully inside
         xmin = random.randint(0, W - rot_w)
         ymin = random.randint(0, H - rot_h)
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        # convert local quad to global image coords
-        poly_global = [(float(px + xmin), float(py + ymin)) for (px, py) in quad_local]
+        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
-            "img": card_img,
+            "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "poly": poly_global,
+            "tl_quad": tl_quad,
+            "br_quad": br_quad,
         })
-
 
     return placements
 
-def fan_cluster_instances(card_variants, W, H):
-    """
-    Simulate a right-hand poker fan:
-    - LAST card is most clockwise / in front.
-    - Earlier cards are tucked behind to the left.
-    """
 
+def fan_cluster_instances(card_variants, W, H):
     placements = []
 
-    # only keep card classes that actually have at least one image
-    available_classes = [
-        cls for cls, style_dict in card_variants.items()
-        if any(len(imgs) > 0 for imgs in style_dict.values())
-    ]
+    available_classes = _available_classes(card_variants)
     if len(available_classes) == 0:
         return placements
 
-    # 2–5 cards in the fan
     k = random.randint(2, 5)
     chosen_classes = random.sample(available_classes, k=min(k, len(available_classes)))
 
@@ -483,14 +481,13 @@ def fan_cluster_instances(card_variants, W, H):
     if any(img is None for img in base_images):
         return placements
 
-    # "in hand" card size
     fan_frac_min = 0.18
     fan_frac_max = 0.22
     fan_width_fraction = random.uniform(fan_frac_min, fan_frac_max)
     target_card_w = int(W * fan_width_fraction)
 
     start_angle = random.uniform(-20, 30)
-    step_deg    = random.uniform(9, 16)
+    step_deg = random.uniform(9, 16)
 
     anchor_x = random.randint(int(0.45 * W), int(0.85 * W))
     anchor_y = random.randint(int(0.55 * H), int(0.95 * H))
@@ -507,17 +504,16 @@ def fan_cluster_instances(card_variants, W, H):
 
         angle = start_angle - i * step_deg
 
-        # 1) quad in SAME coord frame as rotated(expand=True)
-        quad_local = compute_rotated_quad(new_w, new_h, angle)
-
-        # 2) rotate image
+        whole_rot = _rotate_full_card(new_w, new_h, angle)
         rotated = card_img.rotate(angle, expand=True)
         rot_w, rot_h = rotated.size
 
-        # 3) “grip point” = bottom-right vertex in that same frame
-        grip_rot_x, grip_rot_y = quad_local[2]
+        # grip = bottom-right in rotated coords
+        xs = whole_rot[:, 0]
+        ys = whole_rot[:, 1]
+        br_idx = np.argmax(xs + ys)
+        grip_rot_x, grip_rot_y = whole_rot[br_idx]
 
-        # 4) offsets so earlier cards are pushed left/up
         dist_from_front = (k - 1) - i
         fan_offset_x = -dist_from_front * (0.08 * new_w)
         fan_offset_y = -dist_from_front * (0.03 * new_h)
@@ -527,52 +523,80 @@ def fan_cluster_instances(card_variants, W, H):
         xmax = xmin + rot_w
         ymax = ymin + rot_h
 
-        poly_global = [(float(px + xmin), float(py + ymin)) for (px, py) in quad_local]
+        tl_quad, br_quad = _compute_corner_quads(new_w, new_h, angle, xmin, ymin)
 
         placements.append({
             "cls": cls,
             "img": rotated,
             "bbox": (xmin, ymin, xmax, ymax),
-            "poly": poly_global,
+            "tl_quad": tl_quad,
+            "br_quad": br_quad,
         })
 
-        # keep this fan only if all its cards are fully inside the background
     for p in placements:
         x1, y1, x2, y2 = p["bbox"]
         if x1 < 0 or y1 < 0 or x2 > W or y2 > H:
-            # discard this entire fan – we'll just not use it
             return []
 
-    # shift whole fan so all cards are fully inside the image
     placements = shift_placements_inside(placements, W, H)
-
     return placements
+
+
+# -----------------------
+# Compose & labels
+# -----------------------
+
+def quad_to_bbox_clamped(quad, W, H, min_size=4):
+    """
+    Given a list of 4 (x, y) points in GLOBAL coords, return an axis-aligned
+    bbox (xmin, ymin, xmax, ymax) clamped inside the image [0,W) x [0,H).
+    Returns None if the box is degenerate or too small.
+    """
+    xs = np.array([p[0] for p in quad], dtype=np.float32)
+    ys = np.array([p[1] for p in quad], dtype=np.float32)
+
+    xmin = float(xs.min())
+    xmax = float(xs.max())
+    ymin = float(ys.min())
+    ymax = float(ys.max())
+
+    # clamp to image
+    xmin = max(0.0, min(float(W - 1), xmin))
+    ymin = max(0.0, min(float(H - 1), ymin))
+    xmax = max(0.0, min(float(W - 1), xmax))
+    ymax = max(0.0, min(float(H - 1), ymax))
+
+    if xmax <= xmin or ymax <= ymin:
+        return None
+
+    if (xmax - xmin) < min_size or (ymax - ymin) < min_size:
+        return None
+
+    return xmin, ymin, xmax, ymax
+
 
 def compose_on_background(bg_img, placements):
     """
-    Paste all given card placements into bg_img and return:
-        composite    : final BGR image (H x W x 3, uint8)
-        annotations  : [(class_id, xmin, ymin, xmax, ymax), ...]
-        seg_polys    : [(class_id, [(x1,y1), ...]), ...]
+    Produce:
+      composite_bgr: HxWx3 uint8
+      annotations:   list of (class_id, xmin, ymin, xmax, ymax)
 
-    IMPORTANT:
-    - We first render the cards in their natural order (back -> front)
-      so the image looks correct.
-    - Then we compute VISIBLE masks in the opposite order (front -> back),
-      using the alpha channel and an occupancy map.
-    - We drop instances that are too heavily occluded so they don't
-      produce crazy skinny triangles/strips.
+    - We paste all cards (back->front) using RGBA alpha.
+    - For each card, we use its precomputed corner quads (tl_quad / br_quad)
+      to build tight axis-aligned boxes for TL / BR corner patches.
+
+    NO alpha-based occupancy tricks here: just pure geometry.
+    This guarantees the boxes are glued to the corners for any rotation.
     """
     bg = bg_img.copy()
     W, H = bg.size
 
-    # --- 1) Draw all cards once (back -> front) ---
-    # placements are already ordered from back to front by our generators
+    # 1) draw cards back->front in the order they appear
     for p in placements:
-        card_img = p["img"]           # PIL RGBA
+        card_img = p["img"]  # PIL RGBA
         xmin, ymin, xmax, ymax = p["bbox"]
 
-        # clip bbox to image bounds
+        # clip bbox to image
         vis_xmin = max(int(xmin), 0)
         vis_ymin = max(int(ymin), 0)
         vis_xmax = min(int(xmax), W)
@@ -581,152 +605,64 @@ def compose_on_background(bg_img, placements):
         if vis_xmin >= vis_xmax or vis_ymin >= vis_ymax:
             continue
 
-        # crop visible portion of the card
         crop_left   = vis_xmin - xmin
         crop_top    = vis_ymin - ymin
         crop_right  = crop_left + (vis_xmax - vis_xmin)
         crop_bottom = crop_top  + (vis_ymax - vis_ymin)
 
         card_visible = card_img.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        # paste with alpha
         bg.paste(card_visible, (vis_xmin, vis_ymin), card_visible)
 
-    # --- 2) Build segmentation labels (front -> back) ---
-    occupancy = np.zeros((H, W), dtype=bool)   # where foreground is already taken by FRONT cards
+    # 2) build corner bboxes from corner quads
     annotations = []
-    seg_polys = []
 
-    # thresholds to avoid crazy tiny/skinny masks
-    MIN_VIS_PIXELS   = 50        # absolute minimum visible pixels
-    MIN_VIS_FRACTION = 0.10       # require at least 25% of the card to be visible
-
-    # process from front card to back card
-    for p in reversed(placements):
+    for p in placements:
         cls = p["cls"]
-        card_img = p["img"]
-        xmin, ymin, xmax, ymax = p["bbox"]
+        tl_quad = p.get("tl_quad")
+        br_quad = p.get("br_quad")
 
-        # clip bbox again
-        vis_xmin = max(int(xmin), 0)
-        vis_ymin = max(int(ymin), 0)
-        vis_xmax = min(int(xmax), W)
-        vis_ymax = min(int(ymax), H)
+        class_id = LABEL_ORDER.index(cls)  # LABEL_ORDER must match YAML 'names' order
 
-        if vis_xmin >= vis_xmax or vis_ymin >= vis_ymax:
-            continue
+        if tl_quad is not None:
+            bbox = quad_to_bbox_clamped(tl_quad, W, H)
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                annotations.append((class_id, x1, y1, x2, y2))
 
-        crop_left   = vis_xmin - xmin
-        crop_top    = vis_ymin - ymin
-        crop_right  = crop_left + (vis_xmax - vis_xmin)
-        crop_bottom = crop_top  + (vis_ymax - vis_ymin)
+        if br_quad is not None:
+            bbox = quad_to_bbox_clamped(br_quad, W, H)
+            if bbox is not None:
+                x1, y1, x2, y2 = bbox
+                annotations.append((class_id, x1, y1, x2, y2))
 
-        card_visible = card_img.crop((crop_left, crop_top, crop_right, crop_bottom))
-
-        if card_visible.mode != "RGBA":
-            # fallback: label as plain bbox if alpha missing
-            class_id = CARD_CLASSES.index(cls)
-            annotations.append((class_id, vis_xmin, vis_ymin, vis_xmax, vis_ymax))
-            continue
-
-        # alpha mask in local coords
-        alpha = np.array(card_visible.split()[-1])   # H_vis x W_vis
-        mask_local = alpha > 10
-        if not mask_local.any():
-            continue
-
-        h_vis, w_vis = mask_local.shape
-
-        # full-frame mask of this card region
-        card_mask_full = np.zeros((H, W), dtype=bool)
-        card_mask_full[vis_ymin:vis_ymin + h_vis,
-                       vis_xmin:vis_xmin + w_vis] = mask_local
-
-        full_area = int(card_mask_full.sum())
-        if full_area == 0:
-            continue
-
-        # visible area = card - regions already occupied by closer cards
-        visible_mask = card_mask_full & (~occupancy)
-        vis_area = int(visible_mask.sum())
-
-        # --- filter out heavily occluded cards ---
-        if vis_area < MIN_VIS_PIXELS or (vis_area / full_area) < MIN_VIS_FRACTION:
-            # still update occupancy so deeper cards don't shine through
-            occupancy |= card_mask_full
-            continue
-
-        ys, xs = np.where(visible_mask)
-        pts = np.stack([xs, ys], axis=1).astype(np.float32)  # (N,2) [x,y]
-
-        # oriented minimal rectangle over visible pixels
-        rect = cv2.minAreaRect(pts)      # ((cx,cy),(w,h),angle)
-        box = cv2.boxPoints(rect)        # 4x2 float
-        poly = [(float(x), float(y)) for (x, y) in box]
-
-        # clamp polygon to image bounds
-        clamped = []
-        for px, py in poly:
-            px = min(max(px, 0.0), float(W - 1))
-            py = min(max(py, 0.0), float(H - 1))
-            clamped.append((px, py))
-
-        xs_poly = [pt[0] for pt in clamped]
-        ys_poly = [pt[1] for pt in clamped]
-        bb_xmin, bb_xmax = min(xs_poly), max(xs_poly)
-        bb_ymin, bb_ymax = min(ys_poly), max(ys_poly)
-
-        class_id = CARD_CLASSES.index(cls)
-        annotations.append(
-            (class_id, int(bb_xmin), int(bb_ymin), int(bb_xmax), int(bb_ymax))
-        )
-        seg_polys.append((class_id, clamped))
-
-        # mark this card as occupying its whole area for deeper cards
-        occupancy |= card_mask_full
-
-    # we iterated placements in reversed order; if you care about order
-    # (not necessary for YOLO) you can reverse lists, but it's not required.
     composite = np.array(bg)[:, :, ::-1]  # RGB -> BGR
-    return composite, annotations, seg_polys
+    return composite, annotations
+
 
 # -----------------------
 # realism augs
 # -----------------------
 
 def apply_post_augs(img_bgr):
-    """
-    Heavier 'camera / phone' style augs:
-    - stronger brightness/contrast jitter
-    - random color cast
-    - Gaussian / motion blur
-    - Gaussian noise
-    - JPEG compression artifacts
-    """
     out = img_bgr.astype(np.float32)
 
-    # --- brightness & contrast ---
     if random.random() < 0.9:
-        alpha = random.uniform(0.6, 1.3)   # contrast
-        beta  = random.uniform(-45, 35)    # brightness
+        alpha = random.uniform(0.6, 1.3)
+        beta = random.uniform(-45, 35)
         out = out * alpha + beta
 
-    # --- subtle color cast / white balance shift ---
     if random.random() < 0.7:
-        # RGB scaling
         rb = random.uniform(0.9, 1.1)
         gb = random.uniform(0.9, 1.1)
         bb = random.uniform(0.9, 1.1)
         color_gain = np.array([bb, gb, rb], dtype=np.float32).reshape(1, 1, 3)
         out = out * color_gain
 
-    # --- blur (Gaussian or cheap 'motion' blur) ---
     if random.random() < 0.6:
         if random.random() < 0.5:
             k = random.choice([3, 5, 7])
             out = cv2.GaussianBlur(out, (k, k), sigmaX=random.uniform(0.8, 2.0))
         else:
-            # simple motion blur: average along horizontal or vertical
             k = random.choice([3, 5, 7])
             kernel = np.zeros((k, k), np.float32)
             if random.random() < 0.5:
@@ -735,15 +671,13 @@ def apply_post_augs(img_bgr):
                 kernel[:, int((k - 1) / 2)] = 1.0 / k
             out = cv2.filter2D(out, -1, kernel)
 
-    # --- Gaussian noise ---
     if random.random() < 0.7:
         sigma = random.uniform(5, 18)
         noise = np.random.normal(0, sigma, out.shape).astype(np.float32)
         out = out + noise
 
-    # --- JPEG compression artifacts ---
     if random.random() < 0.6:
-        quality = random.randint(25, 70)  # lower = more artifacts
+        quality = random.randint(25, 70)
         enc_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         ok, enc = cv2.imencode(".jpg", np.clip(out, 0, 255).astype(np.uint8), enc_param)
         if ok:
@@ -752,58 +686,27 @@ def apply_post_augs(img_bgr):
     out = np.clip(out, 0, 255).astype(np.uint8)
     return out
 
+
 def save_example(idx, img_bgr, annotations):
     """
-    Write final .jpg and .txt
+    Save detection-style YOLO labels for 52 card classes.
     """
     img_h, img_w = img_bgr.shape[:2]
 
-    img_path = IMAGES_DIR / f"img_{idx:06d}.jpg"
-    lbl_path = LABELS_DIR / f"img_{idx:06d}.txt"
+    img_path = CORNER_IMAGES_DIR / f"img_{idx:06d}.jpg"
+    lbl_path = CORNER_LABELS_DIR / f"img_{idx:06d}.txt"
 
     cv2.imwrite(str(img_path), img_bgr)
+
+    if not annotations:
+        with open(lbl_path, "w") as f:
+            pass
+        return
 
     lines = []
     for class_id, xmin, ymin, xmax, ymax in annotations:
         cx, cy, w, h = bbox_to_yolo(xmin, ymin, xmax, ymax, img_w, img_h)
         lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-    with open(lbl_path, "w") as f:
-        f.write("\n".join(lines))
-
-def save_example_seg(idx, img_bgr, seg_polys):
-    """
-    Save image and YOLO-segmentation labels in *polygon-only* format:
-
-        class x1 y1 x2 y2 ... xN yN
-
-    All coords normalized to [0,1].
-    We compress all cards into a single class: 0 = 'card'.
-    """
-    img_h, img_w = img_bgr.shape[:2]
-
-    img_path = SEG_IMAGES_DIR / f"img_{idx:06d}.jpg"
-    lbl_path = SEG_LABELS_DIR / f"img_{idx:06d}.txt"
-
-    cv2.imwrite(str(img_path), img_bgr)
-
-    lines = []
-    for _, poly in seg_polys:  # ignore original class_id, treat everything as 'card'
-        if len(poly) < 3:
-            continue
-
-        # normalize polygon coords
-        norm_coords = []
-        for px, py in poly:
-            nx = px / float(img_w)
-            ny = py / float(img_h)
-            norm_coords.append(nx)
-            norm_coords.append(ny)
-
-        seg_str = " ".join(f"{v:.6f}" for v in norm_coords)
-        # single-class: 0 = 'card'
-        line = f"0 {seg_str}"
-        lines.append(line)
-
     with open(lbl_path, "w") as f:
         f.write("\n".join(lines))
 
@@ -822,63 +725,58 @@ def main():
         print("[FATAL] You have no backgrounds in data/backgrounds/. Add images first.")
         return
 
-    if all(len(v) == 0 for v in card_variants.values()):
+    if all(all(len(imgs) == 0 for imgs in style_dict.values())
+           for style_dict in card_variants.values()):
         print("[FATAL] You have no cards in data/raw_cards/(normal|inverted|real).")
         return
 
-    num_samples = 2500  # scale up later
-    HARD_NEG_PROB = 0.08   # % images with no cards but card-like clutter
-    HARD_POS_PROB = 0.22   # % images as 'hard' fans
+    num_samples = 20  # scale up for real training
+    HARD_NEG_PROB = 0.08   # 8% pure clutter/background
+    HARD_POS_PROB = 0.25   # 25% hard fans
 
-
-    for i in tqdm(range(num_samples), desc="Generating synthetic dataset"):
+    for i in tqdm(range(num_samples), desc="Generating corner-based dataset"):
         bg_img = random.choice(backgrounds)
         W, H = bg_img.size
 
         mode_r = random.random()
 
-        # --- 1) HARD NEGATIVE: no cards, just background + fake occluders ---
+        # 1) hard negative: background + occluders, NO labels
         if mode_r < HARD_NEG_PROB:
-            img_bgr, ann = make_hard_negative_example(backgrounds)
+            img_bgr = make_hard_negative_example(backgrounds)
             img_bgr = apply_post_augs(img_bgr)
-            # no cards => no polygons
-            save_example_seg(i, img_bgr, [])
+            save_example(i, img_bgr, [])
             continue
 
-        # --- 2) HARD POSITIVE: nasty overlapping fan near edges ---
+        # 2) hard fans near edges
         elif mode_r < HARD_NEG_PROB + HARD_POS_PROB:
             placements = hard_fan_instances(card_variants, W, H)
-            # optionally add 0–1 extra stray card somewhere else
-            extra = random_single_card_instances(card_variants, W, H, num_cards=random.randint(0, 1))
+            extra = random_single_card_instances(card_variants, W, H,
+                                                 num_cards=random.randint(0, 1))
             placements.extend(extra)
 
-        # --- 3) NORMAL MIXTURE (your existing behaviour) ---
+        # 3) normal mixture
         else:
             if random.random() < 0.7:
                 placements = fan_cluster_instances(card_variants, W, H)
-                extra = random_single_card_instances(card_variants, W, H, num_cards=random.randint(0, 2))
+                extra = random_single_card_instances(card_variants, W, H,
+                                                     num_cards=random.randint(0, 2))
                 placements.extend(extra)
             else:
-                placements = random_single_card_instances(card_variants, W, H, num_cards=random.randint(2, 7))
+                placements = random_single_card_instances(card_variants, W, H,
+                                                          num_cards=random.randint(2, 7))
 
-        # NEW: if no cards placed at all (unintentional empty), regenerate this index
         if not placements:
+            img_bgr = make_hard_negative_example(backgrounds)
+            img_bgr = apply_post_augs(img_bgr)
+            save_example(i, img_bgr, [])
             continue
 
-        img_bgr, ann, seg_polys = compose_on_background(bg_img, placements)
+        img_bgr, annotations = compose_on_background(bg_img, placements)
         img_bgr = apply_post_augs(img_bgr)
+        save_example(i, img_bgr, annotations)
 
-        # if compose produced no polygons, treat as intentional negative only
-        if not seg_polys:
-            # if you actually *want* some real hard negatives, you can
-            # either call save_example_seg(i, img_bgr, []) here
-            # or just skip this sample:
-            #   i -= 1; continue
-            save_example_seg(i, img_bgr, [])
-        else:
-            save_example_seg(i, img_bgr, seg_polys)
+    print("Done generating 52-class corner-based dataset.")
 
-    print("Done generating synthetic dataset.")
 
 if __name__ == "__main__":
     main()
