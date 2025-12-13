@@ -27,7 +27,7 @@ def main():
     random.shuffle(all_images)
 
     n_total = len(all_images)
-    n_train = int(0.85 * n_total)
+    n_train = int(0.88 * n_total)
     train_imgs = set(all_images[:n_train])
     val_imgs   = set(all_images[n_train:])
 
