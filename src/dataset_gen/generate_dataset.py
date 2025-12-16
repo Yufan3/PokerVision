@@ -3,12 +3,13 @@ import argparse
 import random
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
+from itertools import combinations
 
 from src.utils.config import (
     ensure_dirs,
@@ -24,8 +25,7 @@ from src.dataset_gen.yolo_label_utils import bbox_to_yolo
 # IMPORTANT: bump whenever you change ROI/segmentation/selection
 # so masks are recomputed.
 # -----------------------
-CACHE_VERSION = "v5b_bordercut_all_sides_hardneg_symbols_20251213"
-
+CACHE_VERSION = "v6_edgeContours_primary_fallbackLab_hysteresis_fixedPlacement_20251214"
 
 # Fixed label order: rank-major (2..A), suit alphabetical (C, D, H, S)
 LABEL_ORDER = [
@@ -44,7 +44,6 @@ LABEL_ORDER = [
     "AC", "AD", "AH", "AS",
 ]
 
-
 # -----------------------
 # Dataset paths
 # -----------------------
@@ -54,68 +53,173 @@ CORNER_LABELS_DIR = CORNER_BASE_DIR / "labels"
 DEBUG_DIR = CORNER_BASE_DIR / "debug"
 MASK_CACHE_DIR = CORNER_BASE_DIR / "mask_cache"
 
+# -----------------------
+# Debug paths
+# -----------------------
+ROI_DEBUG_ASSETS_DIR = CORNER_BASE_DIR / "roi_debug_assets"
+ROI_DEBUG_GEN_CARDS_DIR = CORNER_BASE_DIR / "roi_debug_generated_cards"
+ROI_DEBUG_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+ROI_DEBUG_GEN_CARDS_DIR.mkdir(parents=True, exist_ok=True)
+
 for d in [CORNER_IMAGES_DIR, CORNER_LABELS_DIR, DEBUG_DIR, MASK_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-
 # -----------------------
-# Corner ROI fractions (raw card coords)
+# Corner ROI fractions (raw upright card coords)
 # Keep ROI big enough to contain BOTH rank+small suit for all ranks.
 # -----------------------
-TL_X0_F, TL_Y0_F = 0.01, 0.01
-TL_X1_F, TL_Y1_F = 0.22, 0.28
-
+# User-requested ROI
+TL_X0_F, TL_Y0_F = 0.022, 0.014
+TL_X1_F, TL_Y1_F = 0.220, 0.360
 
 # -----------------------
 # Segmentation thresholds
 # -----------------------
 ALPHA_THR = 10  # ignore transparent pixels in assets and in composed alpha
 
-# strict -> lenient
-INK_DIST_THR_CANDIDATES = [14.0, 12.0, 10.0, 8.0]
+# LAB-distance fallback candidates (strict -> lenient)
+INK_DIST_THR_CANDIDATES = [12, 11, 10, 9, 8, 7]
 
 # Small noise reject
-MIN_COMP_AREA = 10
+MIN_COMP_AREA = 6
 MIN_INK_PIXELS_ROI = 40
 
-# Morphology
+# Morphology (kept conservative; dilation merges into pips/patterns)
 OPEN_ITERS = 0
-CLOSE_ITERS_PRE = 1      # before subset selection
-CLOSE_ITERS_POST = 1     # after selection (then re-select)
-DILATE_ITERS = 0         # keep 0; dilation is the #1 reason it merges to pips/pattern
-
+CLOSE_ITERS_PRE = 0
+CLOSE_ITERS_POST = 0
+DILATE_ITERS = 0
 
 # -----------------------
-# Subset-selection constraints (this is the critical part)
+# Edge-based corner extraction (PRIMARY)
+# -----------------------
+EDGE_BLUR_K = 5              # odd
+EDGE_DILATE_ITERS = 1
+EDGE_CLOSE_ITERS = 1
+
+EDGE_MIN_AREA_FRAC = 0.0009  # fraction of ROI area
+EDGE_MAX_AREA_FRAC = 0.45
+EDGE_MIN_SOLIDITY = 0.22
+
+# reject contours touching ROI border (frame lines)
+EDGE_BORDER_MARGIN_FRAC = 0.015
+EDGE_BORDER_MARGIN_PX_MIN = 2
+EDGE_BORDER_MARGIN_PX_MAX = 10
+
+# stripe rejection in ROI coords
+STRIPE_THIN_FRAC = 0.06      # thin dimension threshold
+STRIPE_LONG_FRAC = 0.55      # long dimension threshold
+
+# -----------------------
+# Subset-selection constraints (SECONDARY clean-up)
 # -----------------------
 TL_CX_MAX_FRAC = 0.92
 TL_CY_MAX_FRAC = 0.94
 
-# IMPORTANT CHANGE:
-# Reject components that touch ANY ROI border within this many pixels.
-# This removes “middle patterns” when the ROI border cuts through them.
+# IMPORTANT: reject components touching ANY ROI border within this many pixels.
+# Since ROI starts inside the card edge, valid symbols shouldn't touch ROI borders.
 TL_BORDER_PX = 2
 
-UNION_MAX_AREA_FRAC = 0.94
-UNION_MIN_H_FRAC = 0.20
-UNION_MIN_W_FRAC = 0.12
-UNION_MAX_X2_FRAC = 0.95
-UNION_MAX_Y2_FRAC = 0.97
+UNION_MAX_AREA_FRAC = 0.92
+UNION_MIN_W_FRAC = 0.10
+UNION_MIN_H_FRAC = 0.10
+UNION_MAX_X2_FRAC = 0.93
+UNION_MAX_Y2_FRAC = 0.94
 
+REL_AREA_KEEP_FRAC = 0.001
+MAX_CANDIDATES = 12
+MAX_SUBSET = 7
+
+# rank/suit bands (NON-overlapping)
+RANKLIKE_CY_MAX_FRAC = 0.48
+SUITLIKE_CY_MIN_FRAC = 0.58
+
+UNION_X1_MAX_FRAC = 0.50
+UNION_Y1_MAX_FRAC = 0.70
+
+UNION_MAX_W_FRAC = 0.75
+UNION_MAX_H_FRAC = 0.90
 
 # -----------------------
 # Label visibility thresholds (on composed image)
 # -----------------------
 MIN_INK_PIXELS_GLOBAL = 35
-MIN_VISIBLE_FRACTION = 0.55
-
+MIN_VISIBLE_FRACTION = 0.50
+MIN_INFRAME_FRACTION = 0.85
 
 # -----------------------
 # Placement distribution
 # -----------------------
-HARD_NEG_PROB_DEFAULT = 0.1
+HARD_NEG_PROB_DEFAULT = 1
 NUM_CARDS_MIN = 2
 NUM_CARDS_MAX = 7
+
+# -----------------------
+# Hysteresis thresholding (LAB fallback)
+# -----------------------
+USE_HYSTERESIS = True
+HYST_DELTA = 6
+HYST_MAX_ITERS = 25
+DIST_BLUR_K = 3            # must be odd >=3 if used
+DIST_BLUR_SIGMA = 0.6
+
+
+# -----------------------
+# Debug helpers
+# -----------------------
+def _mask_u8_from_bool(m: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if m is None:
+        return None
+    if m.dtype == np.bool_:
+        return (m.astype(np.uint8) * 255)
+    if m.dtype != np.uint8:
+        return m.astype(np.uint8)
+    return m
+
+def _convex_hull_from_mask(mask_u8: np.ndarray) -> Optional[np.ndarray]:
+    if mask_u8 is None or mask_u8.ndim != 2:
+        return None
+    if int((mask_u8 > 0).sum()) < 5:
+        return None
+    cnts, _ = cv2.findContours((mask_u8 > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    pts = np.vstack(cnts)
+    if pts.shape[0] < 3:
+        return None
+    return cv2.convexHull(pts)
+
+def _draw_roi_and_hulls_on_rgba(
+    card_rgba: Image.Image,
+    roi_rect_mask_u8: Optional[np.ndarray],
+    tl_mask_u8: Optional[np.ndarray],
+    br_mask_u8: Optional[np.ndarray],
+) -> np.ndarray:
+    """
+    Returns BGR uint8 image with:
+      - ROI rectangle outline (blue)
+      - TL mask convex hull (green)
+      - BR mask convex hull (yellow)
+    """
+    bgr = cv2.cvtColor(np.array(card_rgba), cv2.COLOR_RGBA2BGR)
+
+    if roi_rect_mask_u8 is not None:
+        cnts, _ = cv2.findContours((roi_rect_mask_u8 > 0).astype(np.uint8),
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            cv2.drawContours(bgr, cnts, -1, (255, 0, 0), 2)
+
+    if tl_mask_u8 is not None:
+        hull = _convex_hull_from_mask(tl_mask_u8)
+        if hull is not None:
+            cv2.polylines(bgr, [hull], True, (0, 255, 0), 2)
+
+    if br_mask_u8 is not None:
+        hull = _convex_hull_from_mask(br_mask_u8)
+        if hull is not None:
+            cv2.polylines(bgr, [hull], True, (0, 255, 255), 2)
+
+    return bgr
 
 
 # -----------------------
@@ -133,11 +237,9 @@ def load_backgrounds() -> List[Image.Image]:
         print("[ERROR] No backgrounds found in data/backgrounds/")
     return bgs
 
-
 def _pil_to_bgra(pil_rgba: Image.Image) -> np.ndarray:
     arr = np.array(pil_rgba)  # RGBA
     return arr[:, :, [2, 1, 0, 3]].copy()  # BGRA
-
 
 def _roi_from_frac(w: int, h: int, x0f: float, y0f: float, x1f: float, y1f: float) -> Tuple[int, int, int, int]:
     x0 = int(round(x0f * w))
@@ -154,33 +256,21 @@ def _roi_from_frac(w: int, h: int, x0f: float, y0f: float, x1f: float, y1f: floa
         y1 = min(h, y0 + 1)
     return x0, y0, x1, y1
 
+def _ensure_odd_ksize(k: int) -> int:
+    k = int(k)
+    if k < 3:
+        return 0
+    if k % 2 == 0:
+        k += 1
+    return k
 
-def _estimate_bg_lab(zone_bgra: np.ndarray) -> np.ndarray:
-    """
-    Estimate background paper LAB color from border pixels of ROI.
-    Uses median of border pixels with alpha > ALPHA_THR.
-    """
-    h, w = zone_bgra.shape[:2]
-    a = zone_bgra[:, :, 3]
-    opaque = a > ALPHA_THR
-
-    border = np.zeros((h, w), np.uint8)
-    border[0:2, :] = 1
-    border[h - 2:h, :] = 1
-    border[:, 0:2] = 1
-    border[:, w - 2:w] = 1
-    border_mask = (border.astype(bool) & opaque)
-
-    if border_mask.sum() < 30:
-        border_mask = opaque
-
-    bgr = zone_bgra[:, :, :3]
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    vals = lab[border_mask]
-    if vals.size == 0:
-        return np.array([255, 128, 128], dtype=np.float32)
-    return np.median(vals.reshape(-1, 3), axis=0).astype(np.float32)
-
+def _auto_canny(gray: np.ndarray, sigma: float = 0.33) -> Tuple[int, int]:
+    v = float(np.median(gray))
+    lo = int(max(0, (1.0 - sigma) * v))
+    hi = int(min(255, (1.0 + sigma) * v))
+    if hi <= lo:
+        hi = min(255, lo + 40)
+    return lo, hi
 
 def _union_bbox(comps: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, int]:
     x1 = min(c[0] for c in comps)
@@ -189,18 +279,102 @@ def _union_bbox(comps: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, 
     y2 = max(c[3] for c in comps)
     return x1, y1, x2, y2
 
-
 def _bbox_area(b: Tuple[int, int, int, int]) -> int:
     x1, y1, x2, y2 = b
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+# -----------------------
+# PRIMARY corner mask: edges -> contours -> filled selected contours
+# -----------------------
+def _edge_contour_ink_mask(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
+    zh, zw = zone_bgra.shape[:2]
+    if zh < 8 or zw < 8:
+        return None
+
+    bgr = zone_bgra[:, :, :3]
+    a = zone_bgra[:, :, 3]
+    opaque = (a > ALPHA_THR)
+
+    if int(opaque.sum()) < 60:
+        return None
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # Make transparent pixels neutral so they don't create edges
+    med = int(np.median(gray[opaque]))
+    gray2 = gray.copy()
+    gray2[~opaque] = med
+
+    k = _ensure_odd_ksize(EDGE_BLUR_K)
+    if k:
+        gray2 = cv2.GaussianBlur(gray2, (k, k), 0)
+
+    t1, t2 = _auto_canny(gray2, sigma=0.33)
+    edges = cv2.Canny(gray2, t1, t2)
+    edges = (edges & (opaque.astype(np.uint8) * 255)).astype(np.uint8)
+
+    kernel = np.ones((3, 3), np.uint8)
+    if EDGE_DILATE_ITERS > 0:
+        edges = cv2.dilate(edges, kernel, iterations=EDGE_DILATE_ITERS)
+    if EDGE_CLOSE_ITERS > 0:
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=EDGE_CLOSE_ITERS)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    roi_area = float(zh * zw)
+    min_area = max(20.0, EDGE_MIN_AREA_FRAC * roi_area)
+    max_area = EDGE_MAX_AREA_FRAC * roi_area
+
+    margin = int(round(EDGE_BORDER_MARGIN_FRAC * min(zh, zw)))
+    margin = max(EDGE_BORDER_MARGIN_PX_MIN, min(EDGE_BORDER_MARGIN_PX_MAX, margin))
+
+    keep: List[np.ndarray] = []
+    for c in cnts:
+        area = float(cv2.contourArea(c))
+        if area < min_area or area > max_area:
+            continue
+
+        hull = cv2.convexHull(c)
+        hull_area = float(cv2.contourArea(hull))
+        if hull_area <= 1e-6:
+            continue
+        solidity = area / hull_area
+        if solidity < EDGE_MIN_SOLIDITY:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        x2, y2 = x + w, y + h
+
+        # reject anything touching ROI borders (frame lines)
+        if x <= margin or y <= margin or x2 >= (zw - margin) or y2 >= (zh - margin):
+            continue
+
+        # reject stripes
+        if (h / float(zh)) <= STRIPE_THIN_FRAC and (w / float(zw)) >= STRIPE_LONG_FRAC:
+            continue
+        if (w / float(zw)) <= STRIPE_THIN_FRAC and (h / float(zh)) >= STRIPE_LONG_FRAC:
+            continue
+
+        keep.append(c)
+
+    if not keep:
+        return None
+
+    mask = np.zeros((zh, zw), np.uint8)
+    cv2.drawContours(mask, keep, -1, 255, thickness=-1)
+
+    # very light cleanup
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
+
+
+# -----------------------
+# SECONDARY clean-up: connected components + subset selection
+# -----------------------
 def _select_components_subset_tl(ink_u8: np.ndarray) -> np.ndarray:
-    """
-    Candidate components + greedy subset selection.
-    Key rule: reject components that touch ANY ROI border (TL_BORDER_PX),
-    so if ROI cuts through middle pattern, that component gets removed.
-    """
     H, W = ink_u8.shape[:2]
     bin_mask = (ink_u8 > 0).astype(np.uint8)
 
@@ -223,12 +397,19 @@ def _select_components_subset_tl(ink_u8: np.ndarray) -> np.ndarray:
         x2 = x + w
         y2 = y + h
 
-        # ---- IMPORTANT CHANGE: reject if touching ANY ROI border ----
+        # reject components touching ANY ROI border (frame / cut-through)
         if (x <= TL_BORDER_PX) or (y <= TL_BORDER_PX) or (x2 >= (W - TL_BORDER_PX)) or (y2 >= (H - TL_BORDER_PX)):
             continue
 
-        # still keep near TL (loose)
+        # keep near TL (loose)
         if cx >= TL_CX_MAX_FRAC * W or cy >= TL_CY_MAX_FRAC * H:
+            continue
+
+        # reject extreme stripes by bbox aspect
+        bw = max(1, w)
+        bh = max(1, h)
+        aspect = float(max(bw, bh)) / float(min(bw, bh))
+        if aspect > 18.0:
             continue
 
         cand.append((comp_id, area, x, y, x2, y2, float(cx), float(cy)))
@@ -237,30 +418,32 @@ def _select_components_subset_tl(ink_u8: np.ndarray) -> np.ndarray:
         return np.zeros_like(ink_u8)
 
     max_area = max(c[1] for c in cand)
-    rel_keep = []
-    for c in cand:
-        if c[1] >= max(MIN_COMP_AREA, int(0.01 * max_area)):
-            rel_keep.append(c)
-    cand = rel_keep if rel_keep else cand
+    thr_area = max(MIN_COMP_AREA, int(REL_AREA_KEEP_FRAC * max_area))
+    cand_pruned = [c for c in cand if c[1] >= thr_area]
+    if len(cand_pruned) >= 2 or len(cand) == 1:
+        cand = cand_pruned
+
+    if not cand:
+        return np.zeros_like(ink_u8)
 
     roi_area = float(H * W)
 
-    def score_candidate(c):
-        _, area, _, _, _, _, cx, cy = c
-        tl_pen = 0.65 * (cx / W) + 0.85 * (cy / H)
-        return float(area) / (1.0 + tl_pen)
-
-    cand_sorted = sorted(cand, key=score_candidate, reverse=True)
-
-    selected: List[Tuple[int, int, int, int, int]] = []
-    keep_mask = np.zeros_like(bin_mask)
-
     def subset_ok(b):
         x1, y1, x2, y2 = b
-        bw = (x2 - x1)
-        bh = (y2 - y1)
+        bw = x2 - x1
+        bh = y2 - y1
         if bw <= 0 or bh <= 0:
             return False
+
+        if (bw / W) < UNION_MIN_W_FRAC:
+            return False
+        if (bh / H) < UNION_MIN_H_FRAC:
+            return False
+        if (bw / W) > UNION_MAX_W_FRAC:
+            return False
+        if (bh / H) > UNION_MAX_H_FRAC:
+            return False
+
         area_frac = _bbox_area(b) / roi_area
         if area_frac > UNION_MAX_AREA_FRAC:
             return False
@@ -268,76 +451,191 @@ def _select_components_subset_tl(ink_u8: np.ndarray) -> np.ndarray:
             return False
         if (y2 / H) > UNION_MAX_Y2_FRAC:
             return False
+        if (x1 / W) > UNION_X1_MAX_FRAC:
+            return False
+        if (y1 / H) > UNION_Y1_MAX_FRAC:
+            return False
+
         return True
 
-    # start with best comp
-    first = cand_sorted[0]
-    comp_id, _, x, y, x2, y2, _, _ = first
-    selected.append((comp_id, x, y, x2, y2))
-    keep_mask[labels == comp_id] = 1
+    def is_ranklike(c):
+        return (c[7] / H) <= RANKLIKE_CY_MAX_FRAC
 
-    # add more (suit often separate)
-    for c in cand_sorted[1:]:
-        comp_id, _, x, y, x2, y2, _, _ = c
-        cur_boxes = [(s[1], s[2], s[3], s[4]) for s in selected]
-        new_union = _union_bbox(cur_boxes + [(x, y, x2, y2)])
+    def is_suitlike(c):
+        return (c[7] / H) >= SUITLIKE_CY_MIN_FRAC
 
-        if not subset_ok(new_union):
-            continue
+    def y_top_frac(c):
+        return c[3] / H
 
-        cur_union = _union_bbox(cur_boxes)
-        cur_area = _bbox_area(cur_union)
-        new_area = _bbox_area(new_union)
-        if new_area > cur_area * 2.3:
-            continue
+    def y_bot_frac(c):
+        return c[5] / H
 
-        selected.append((comp_id, x, y, x2, y2))
-        keep_mask[labels == comp_id] = 1
+    def spans_both(c):
+        # for a single connected blob that genuinely covers both
+        return (y_top_frac(c) < 0.40) and (y_bot_frac(c) > 0.65)
 
-        if len(selected) >= 4:
-            break
+    def cand_score(c):
+        _, area, x, y, x2, y2, cx, cy = c
+        bw = max(1, x2 - x)
+        bh = max(1, y2 - y)
+        fill = float(area) / float(bw * bh)
+        aspect = float(max(bw, bh)) / float(min(bw, bh))
+        aspect_pen = 1.0 / (1.0 + 0.25 * max(0.0, aspect - 1.0))
+        tl_pen = 0.90 * (cx / W) + 0.90 * (cy / H)
+        return (float(area) * (0.40 + 0.60 * fill) * aspect_pen) / (1.0 + tl_pen)
 
-    # validate union shape (avoid rank-only)
-    sel_boxes = [(s[1], s[2], s[3], s[4]) for s in selected]
-    union = _union_bbox(sel_boxes)
-    bw = union[2] - union[0]
-    bh = union[3] - union[1]
+    cand_all = sorted(cand, key=cand_score, reverse=True)
+    cand_sorted = cand_all[:MAX_CANDIDATES]
 
-    if (bh / float(H)) < UNION_MIN_H_FRAC or (bw / float(W)) < UNION_MIN_W_FRAC:
-        cur_union = union
-        cur_boxes = sel_boxes
-        best_rescue = None
-        best_rescue_score = -1e9
+    need_rank = any(is_ranklike(c) for c in cand)
+    need_suit = any(is_suitlike(c) for c in cand)
 
-        for c in cand_sorted[1:]:
-            comp_id, area, x, y, x2, y2, cx, cy = c
-            if cy <= (cur_union[1] + 0.10 * H):
+    def subset_has_required_parts(subset):
+        has_rank = any(is_ranklike(c) for c in subset)
+        has_suit = any(is_suitlike(c) for c in subset)
+        if need_rank and not has_rank:
+            return False
+        if need_suit and not has_suit:
+            return False
+        if need_rank and need_suit and len(subset) == 1 and not spans_both(subset[0]):
+            return False
+        return True
+
+    def subset_objective(subset, union):
+        ink_area = float(sum(c[1] for c in subset))
+        bbox_area = float(max(1, _bbox_area(union)))
+        density = ink_area / bbox_area
+
+        x1, y1, x2, y2 = union
+        corner_bonus = -0.55 * (x1 / W + y1 / H) - 0.08 * (x2 / W + y2 / H)
+
+        align_bonus = 0.0
+        rank_candidates = [c for c in subset if is_ranklike(c)]
+        suit_candidates = [c for c in subset if is_suitlike(c)]
+        if rank_candidates and suit_candidates:
+            r = min(rank_candidates, key=lambda c: c[7])
+            s = max(suit_candidates, key=lambda c: c[7])
+            dx = abs(r[6] - s[6]) / float(W)
+            sep = (s[7] - r[7]) / float(H)
+            align_bonus += 0.18 * max(0.0, sep - 0.10)
+            align_bonus -= 0.32 * dx
+
+        frag_pen = -0.02 * max(0, len(subset) - 3)
+        return density + 0.00010 * ink_area + corner_bonus + align_bonus + frag_pen
+
+    best_subset = None
+    best_obj = -1e18
+
+    for k in range(1, min(MAX_SUBSET, len(cand_sorted)) + 1):
+        for subset in combinations(cand_sorted, k):
+            if not subset_has_required_parts(subset):
                 continue
-            new_union = _union_bbox(cur_boxes + [(x, y, x2, y2)])
-            if not subset_ok(new_union):
+            boxes = [(c[2], c[3], c[4], c[5]) for c in subset]
+            union = _union_bbox(boxes)
+            if not subset_ok(union):
                 continue
-            grow = max(1.0, _bbox_area(new_union) - _bbox_area(cur_union))
-            s = float(area) / grow
-            if s > best_rescue_score:
-                best_rescue_score = s
-                best_rescue = (comp_id, x, y, x2, y2)
+            obj = subset_objective(subset, union)
+            if obj > best_obj:
+                best_obj = obj
+                best_subset = subset
 
-        if best_rescue is not None:
-            comp_id, x, y, x2, y2 = best_rescue
-            selected.append((comp_id, x, y, x2, y2))
-            keep_mask[labels == comp_id] = 1
-            sel_boxes = [(s[1], s[2], s[3], s[4]) for s in selected]
-            union = _union_bbox(sel_boxes)
-            bw = union[2] - union[0]
-            bh = union[3] - union[1]
-
-    if (bh / float(H)) < (UNION_MIN_H_FRAC * 0.85):
+    if best_subset is None:
         return np.zeros_like(ink_u8)
+
+    keep_mask = np.zeros_like(bin_mask)
+    for c in best_subset:
+        keep_mask[labels == c[0]] = 1
 
     return (keep_mask.astype(np.uint8) * 255)
 
 
-def _largest_reasonable_ink_mask(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
+# -----------------------
+# LAB-distance fallback (kept, safer)
+# -----------------------
+def _estimate_bg_lab(zone_bgra: np.ndarray) -> np.ndarray:
+    """
+    Robust background LAB using k-means on opaque pixels.
+    IMPORTANT: to avoid "gold becomes background", we pick the MAJORITY cluster
+    but also bias toward the cluster that is more spatially spread (background tends to be spread).
+    """
+    h, w = zone_bgra.shape[:2]
+    a = zone_bgra[:, :, 3]
+    opaque = a > ALPHA_THR
+
+    if int(opaque.sum()) < 80:
+        return np.array([255, 128, 128], dtype=np.float32)
+
+    bgr = zone_bgra[:, :, :3]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    vals = lab[opaque].reshape(-1, 3)
+    if vals.shape[0] < 80:
+        return np.array([255, 128, 128], dtype=np.float32)
+
+    # subsample for speed
+    if vals.shape[0] > 7000:
+        idx = np.random.choice(vals.shape[0], 7000, replace=False)
+        vals_s = vals[idx]
+    else:
+        vals_s = vals
+
+    K = 3 if vals_s.shape[0] >= 3 else 1
+    if K == 1:
+        return np.median(vals_s, axis=0).astype(np.float32)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.25)
+    _, km_labels, centers = cv2.kmeans(vals_s, K, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
+    km_labels = km_labels.reshape(-1)
+
+    counts = np.array([(km_labels == i).sum() for i in range(K)], dtype=np.float32)
+
+    # spatial spread proxy: sample positions too (cheap)
+    ys, xs = np.where(opaque)
+    if ys.size > 7000:
+        ii = np.random.choice(ys.size, 7000, replace=False)
+        ys_s, xs_s = ys[ii], xs[ii]
+    else:
+        ys_s, xs_s = ys, xs
+
+    # assign sampled positions to labels (approx by sampling same indices length)
+    # (good enough as a bias term)
+    lbl_pos = km_labels[:min(km_labels.size, ys_s.size)]
+    ys_s = ys_s[:lbl_pos.size]
+    xs_s = xs_s[:lbl_pos.size]
+
+    spread = np.zeros((K,), dtype=np.float32)
+    for i in range(K):
+        m = (lbl_pos == i)
+        if m.sum() < 20:
+            spread[i] = 0.0
+        else:
+            spread[i] = float(np.std(xs_s[m]) + np.std(ys_s[m]))
+
+    # score = majority + small spread bonus
+    score = counts + 0.15 * spread
+    bg_idx = int(np.argmax(score))
+    return centers[bg_idx].astype(np.float32)
+
+def _hysteresis_ink_u8(dist: np.ndarray, alpha: np.ndarray, thr_hi: float) -> np.ndarray:
+    thr_lo = float(max(0.0, thr_hi - HYST_DELTA))
+    opaque = (alpha > ALPHA_THR)
+
+    strong = ((dist > thr_hi) & opaque).astype(np.uint8)
+    if strong.sum() == 0:
+        return strong * 255
+
+    weak = ((dist > thr_lo) & opaque).astype(np.uint8)
+
+    cur = strong.copy()
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(HYST_MAX_ITERS):
+        nxt = (cv2.dilate(cur, kernel, iterations=1) & weak).astype(np.uint8)
+        if np.array_equal(nxt, cur):
+            break
+        cur = nxt
+
+    return (cur * 255).astype(np.uint8)
+
+def _largest_reasonable_ink_mask_lab(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
     zh, zw = zone_bgra.shape[:2]
     if zh < 6 or zw < 6:
         return None
@@ -349,13 +647,20 @@ def _largest_reasonable_ink_mask(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
     dist = np.linalg.norm(lab - bg_lab.reshape(1, 1, 3), axis=2)
 
     kernel = np.ones((3, 3), np.uint8)
-
     best = None
     best_obj = -1e9
 
     for thr in INK_DIST_THR_CANDIDATES:
-        ink = (dist > thr) & (a > ALPHA_THR)
-        ink_u8 = (ink.astype(np.uint8) * 255)
+        dist_use = dist
+        k = _ensure_odd_ksize(DIST_BLUR_K)
+        if k:
+            dist_use = cv2.GaussianBlur(dist_use, (k, k), sigmaX=DIST_BLUR_SIGMA)
+
+        if USE_HYSTERESIS:
+            ink_u8 = _hysteresis_ink_u8(dist_use, a, float(thr))
+        else:
+            ink = (dist_use > float(thr)) & (a > ALPHA_THR)
+            ink_u8 = (ink.astype(np.uint8) * 255)
 
         if OPEN_ITERS > 0:
             ink_u8 = cv2.morphologyEx(ink_u8, cv2.MORPH_OPEN, kernel, iterations=OPEN_ITERS)
@@ -368,49 +673,51 @@ def _largest_reasonable_ink_mask(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
             ink_u8 = cv2.morphologyEx(ink_u8, cv2.MORPH_CLOSE, kernel, iterations=CLOSE_ITERS_POST)
             ink_u8 = _select_components_subset_tl(ink_u8)
 
-        if int((ink_u8 > 0).sum()) < MIN_INK_PIXELS_ROI:
+        ink_pixels = int((ink_u8 > 0).sum())
+        if ink_pixels < MIN_INK_PIXELS_ROI:
             continue
-
-        if DILATE_ITERS > 0:
-            ink_u8 = cv2.dilate(ink_u8, kernel, iterations=DILATE_ITERS)
 
         ys, xs = np.where(ink_u8 > 0)
         if xs.size == 0 or ys.size == 0:
             continue
+
         x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
         bbox_area = max(1, (x2 - x1) * (y2 - y1))
-        ink_area = int((ink_u8 > 0).sum())
-        density = ink_area / float(bbox_area)
-        obj = density + 0.00015 * ink_area
+        density = ink_pixels / float(bbox_area)
+        obj = density + 0.00012 * ink_pixels
 
         if obj > best_obj:
             best_obj = obj
             best = ink_u8.copy()
 
-    if best is not None:
-        return best
-
-    # Fallback: grayscale Otsu (rare)
-    gray = cv2.cvtColor(zone_bgra[:, :, :3], cv2.COLOR_BGR2GRAY)
-    opaque = (zone_bgra[:, :, 3] > ALPHA_THR).astype(np.uint8)
-    if opaque.sum() < 30:
-        return None
-
-    g = gray.copy()
-    g[opaque == 0] = int(np.median(g[opaque == 1]))
-    _, otsu = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    otsu = (otsu & (opaque * 255)).astype(np.uint8)
-
-    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel, iterations=1)
-    otsu = _select_components_subset_tl(otsu)
-    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel, iterations=1)
-    otsu = _select_components_subset_tl(otsu)
-
-    if int((otsu > 0).sum()) < MIN_INK_PIXELS_ROI:
-        return None
-    return otsu
+    return best
 
 
+# -----------------------
+# Combined corner mask selection
+# -----------------------
+def _largest_reasonable_ink_mask(zone_bgra: np.ndarray) -> Optional[np.ndarray]:
+    """
+    PRIMARY: edge-contour mask (robust to black/gold, borders)
+    SECONDARY: lab-distance mask (your old approach, safer now)
+    """
+    m1 = _edge_contour_ink_mask(zone_bgra)
+    if m1 is not None:
+        # secondary cleanup to remove any leftover junk
+        m1 = _select_components_subset_tl(m1)
+        if int((m1 > 0).sum()) >= MIN_INK_PIXELS_ROI:
+            return m1
+
+    m2 = _largest_reasonable_ink_mask_lab(zone_bgra)
+    if m2 is not None and int((m2 > 0).sum()) >= MIN_INK_PIXELS_ROI:
+        return m2
+
+    return None
+
+
+# -----------------------
+# Find TL/BR masks on raw asset
+# -----------------------
 def _find_corner_masks_raw(img_pil_rgba: Image.Image) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     img_bgra = _pil_to_bgra(img_pil_rgba)
     H, W = img_bgra.shape[:2]
@@ -448,7 +755,6 @@ def _save_mask_cache(cache_path: Path, tl_mask: Optional[np.ndarray], br_mask: O
         tl_valid=(1 if tl_mask is not None else 0),
         br_valid=(1 if br_mask is not None else 0),
     )
-
 
 def _load_mask_cache(cache_path: Path) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     if not cache_path.exists():
@@ -495,6 +801,23 @@ def load_card_assets() -> Dict[str, Dict[str, List[CardAsset]]]:
                 tl_mask, br_mask = _load_mask_cache(cache_path)
                 if tl_mask is None and br_mask is None:
                     tl_mask, br_mask = _find_corner_masks_raw(img)
+
+                    # ---- ROI debug dump for raw asset ----
+                    try:
+                        W0, H0 = img.size
+                        x0, y0, x1, y1 = _roi_from_frac(W0, H0, TL_X0_F, TL_Y0_F, TL_X1_F, TL_Y1_F)
+                        roi_rect = np.zeros((H0, W0), np.uint8)
+                        roi_rect[y0:y1, x0:x1] = 255
+
+                        tl_u8 = _mask_u8_from_bool(tl_mask)
+                        br_u8 = _mask_u8_from_bool(br_mask)
+
+                        vis_bgr = _draw_roi_and_hulls_on_rgba(img, roi_rect, tl_u8, br_u8)
+                        out_name = f"{style}__{cls}__{p.parent.name}.jpg"
+                        cv2.imwrite(str(ROI_DEBUG_ASSETS_DIR / out_name), vis_bgr)
+                    except Exception as e:
+                        print(f"[WARN] ROI debug dump failed for {p}: {e}")
+
                     _save_mask_cache(cache_path, tl_mask, br_mask)
 
                 assets[cls][style].append(CardAsset(
@@ -518,7 +841,6 @@ def choose_card_asset(assets_for_cls: Dict[str, List[CardAsset]]) -> Optional[Ca
     style_choice = random.choices(styles, weights=weights, k=1)[0]
     return random.choice(assets_for_cls[style_choice])
 
-
 def _available_classes(card_assets) -> List[str]:
     return [cls for cls, style_dict in card_assets.items() if any(len(lst) > 0 for lst in style_dict.values())]
 
@@ -530,17 +852,11 @@ _RANKS = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 _SUITS = ["♣", "♦", "♥", "♠"]
 
 def _try_load_font(size: int) -> ImageFont.FreeTypeFont:
-    """
-    Prefer fonts that exist on Windows and include suit glyphs.
-    Fall back to DejaVu if available, then PIL default.
-    """
     candidates = [
-        # Windows (most reliable)
-        r"C:\Windows\Fonts\seguisym.ttf",   # Segoe UI Symbol (♣♦♥♠)
+        r"C:\Windows\Fonts\seguisym.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\arialbd.ttf",
-        # Common on linux/conda
         "DejaVuSans-Bold.ttf",
         "DejaVuSans.ttf",
         "LiberationSans-Regular.ttf",
@@ -552,142 +868,18 @@ def _try_load_font(size: int) -> ImageFont.FreeTypeFont:
             continue
     return ImageFont.load_default()
 
-def _render_text_patch(text: str, fs: int, rgb: Tuple[int, int, int]) -> Image.Image:
-    """
-    Render a tight RGBA patch for text. If glyph missing, alpha will be ~0.
-    """
-    font = _try_load_font(fs)
-
-    tmp = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
-    d0 = ImageDraw.Draw(tmp)
-    try:
-        bbox = d0.textbbox((0, 0), text, font=font)
-    except Exception:
-        bbox = (0, 0, fs, fs)
-
-    tw = max(1, bbox[2] - bbox[0])
-    th = max(1, bbox[3] - bbox[1])
-    pad = int(0.45 * fs)
-
-    patch = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
-    d = ImageDraw.Draw(patch)
-
-    # draw a tiny shadow + main text to increase visibility
-    ox = pad - bbox[0]
-    oy = pad - bbox[1]
-    d.text((ox + 2, oy + 2), text, font=font, fill=(0, 0, 0, 110))
-    d.text((ox, oy), text, font=font, fill=(*rgb, 255))
-
-    return patch
-
-def _render_suit_vector(suit: str, fs: int, rgb: Tuple[int, int, int]) -> Image.Image:
-    """
-    Vector fallback for suits (works even if font can't render ♣♦♥♠).
-    """
-    w = int(1.2 * fs)
-    h = int(1.35 * fs)
-    patch = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(patch)
-
-    cx = w // 2
-    cy = int(h * 0.48)
-    s = fs
-
-    fill = (*rgb, 255)
-    shadow = (0, 0, 0, 110)
-
-    def ellipse(x0, y0, x1, y1, f):
-        d.ellipse([x0, y0, x1, y1], fill=f)
-
-    def poly(pts, f):
-        d.polygon(pts, fill=f)
-
-    # simple shapes; not perfect but very readable
-    if suit == "♦":
-        pts = [(cx, int(cy - 0.50*s)),
-               (int(cx + 0.38*s), cy),
-               (cx, int(cy + 0.50*s)),
-               (int(cx - 0.38*s), cy)]
-        poly([(x+2, y+2) for x, y in pts], shadow)
-        poly(pts, fill)
-
-    elif suit == "♥":
-        r = int(0.22*s)
-        ellipse(cx - r - 2, int(cy - 0.20*s) - r, cx - 2 + r, int(cy - 0.20*s) + r, shadow)
-        ellipse(cx + 2 - r, int(cy - 0.20*s) - r, cx + 2 + r, int(cy - 0.20*s) + r, shadow)
-        poly([(cx, int(cy + 0.55*s) + 2),
-              (int(cx - 0.45*s) + 2, int(cy + 0.00*s) + 2),
-              (int(cx + 0.45*s) + 2, int(cy + 0.00*s) + 2)], shadow)
-
-        ellipse(cx - r - 2, int(cy - 0.20*s) - r, cx - 2 + r, int(cy - 0.20*s) + r, fill)
-        ellipse(cx + 2 - r, int(cy - 0.20*s) - r, cx + 2 + r, int(cy - 0.20*s) + r, fill)
-        poly([(cx, int(cy + 0.55*s)),
-              (int(cx - 0.45*s), int(cy + 0.00*s)),
-              (int(cx + 0.45*s), int(cy + 0.00*s))], fill)
-
-    elif suit == "♠":
-        r = int(0.22*s)
-        ellipse(cx - r - 2, int(cy + 0.10*s) - r, cx - 2 + r, int(cy + 0.10*s) + r, shadow)
-        ellipse(cx + 2 - r, int(cy + 0.10*s) - r, cx + 2 + r, int(cy + 0.10*s) + r, shadow)
-        poly([(cx, int(cy - 0.60*s) + 2),
-              (int(cx - 0.45*s) + 2, int(cy + 0.15*s) + 2),
-              (int(cx + 0.45*s) + 2, int(cy + 0.15*s) + 2)], shadow)
-        # stem
-        poly([(int(cx - 0.10*s) + 2, int(cy + 0.15*s) + 2),
-              (int(cx + 0.10*s) + 2, int(cy + 0.15*s) + 2),
-              (cx + 2, int(cy + 0.55*s) + 2)], shadow)
-
-        ellipse(cx - r - 2, int(cy + 0.10*s) - r, cx - 2 + r, int(cy + 0.10*s) + r, fill)
-        ellipse(cx + 2 - r, int(cy + 0.10*s) - r, cx + 2 + r, int(cy + 0.10*s) + r, fill)
-        poly([(cx, int(cy - 0.60*s)),
-              (int(cx - 0.45*s), int(cy + 0.15*s)),
-              (int(cx + 0.45*s), int(cy + 0.15*s))], fill)
-        poly([(int(cx - 0.10*s), int(cy + 0.15*s)),
-              (int(cx + 0.10*s), int(cy + 0.15*s)),
-              (cx, int(cy + 0.55*s))], fill)
-
-    else:  # ♣
-        r = int(0.20*s)
-        ellipse(cx - r - 2, int(cy - 0.10*s) - r, cx - 2 + r, int(cy - 0.10*s) + r, shadow)
-        ellipse(cx + 2 - r, int(cy - 0.10*s) - r, cx + 2 + r, int(cy - 0.10*s) + r, shadow)
-        ellipse(cx - r, int(cy - 0.38*s) - r, cx + r, int(cy - 0.38*s) + r, shadow)
-        poly([(int(cx - 0.10*s) + 2, int(cy - 0.05*s) + 2),
-              (int(cx + 0.10*s) + 2, int(cy - 0.05*s) + 2),
-              (cx + 2, int(cy + 0.55*s) + 2)], shadow)
-
-        ellipse(cx - r - 2, int(cy - 0.10*s) - r, cx - 2 + r, int(cy - 0.10*s) + r, fill)
-        ellipse(cx + 2 - r, int(cy - 0.10*s) - r, cx + 2 + r, int(cy - 0.10*s) + r, fill)
-        ellipse(cx - r, int(cy - 0.38*s) - r, cx + r, int(cy - 0.38*s) + r, fill)
-        poly([(int(cx - 0.10*s), int(cy - 0.05*s)),
-              (int(cx + 0.10*s), int(cy - 0.05*s)),
-              (cx, int(cy + 0.55*s))], fill)
-
-    return patch
-
 def draw_fake_occluders(bg_img: Image.Image, num_shapes=4) -> Image.Image:
-    """
-    Place random SINGLE rank OR SINGLE suit symbol, no outline.
-    Render via mask -> solid fill (clean edges).
-    """
     bg = bg_img.convert("RGB").copy()
     W, H = bg.size
 
     for _ in range(num_shapes):
-        color_choice = random.choice([
-            (0, 0, 0),         # black
-            (200, 0, 0),       # red
-            (205, 170, 60),    # gold-ish
-        ])
-
-        # choose ONE symbol: rank OR suit
+        color_choice = random.choice([(0, 0, 0), (200, 0, 0), (205, 170, 60)])
         text = random.choice(_RANKS) if random.random() < 0.5 else random.choice(_SUITS)
 
-        # ---- bigger + more variable sizes (see next section too) ----
         fs = int(random.uniform(0.045, 0.16) * min(W, H))
         fs = max(18, min(fs, 170))
         font = _try_load_font(fs)
 
-        # measure text bbox
         tmp = Image.new("L", (10, 10), 0)
         d0 = ImageDraw.Draw(tmp)
         bbox = d0.textbbox((0, 0), text, font=font)
@@ -697,17 +889,14 @@ def draw_fake_occluders(bg_img: Image.Image, num_shapes=4) -> Image.Image:
         pad = int(0.35 * fs)
         mw, mh = tw + 2 * pad, th + 2 * pad
 
-        # ---- render text to mask (no outline) ----
         mask = Image.new("L", (mw, mh), 0)
         dm = ImageDraw.Draw(mask)
         dm.text((pad - bbox[0], pad - bbox[1]), text, font=font, fill=255)
 
-        # ---- colorize using mask ----
         patch = Image.new("RGBA", (mw, mh), (0, 0, 0, 0))
         color_layer = Image.new("RGBA", (mw, mh), (*color_choice, 255))
         patch = Image.composite(color_layer, patch, mask)
 
-        # rotate + paste
         angle = random.uniform(-40, 40)
         patch = patch.rotate(angle, expand=True, resample=Image.BICUBIC)
 
@@ -717,14 +906,8 @@ def draw_fake_occluders(bg_img: Image.Image, num_shapes=4) -> Image.Image:
 
     return bg
 
-from typing import Union
-
 def make_hard_negative_example(backgrounds: Union[List[Image.Image], Image.Image]) -> np.ndarray:
-    if isinstance(backgrounds, Image.Image):
-        bg = backgrounds
-    else:
-        bg = random.choice(backgrounds)
-
+    bg = backgrounds if isinstance(backgrounds, Image.Image) else random.choice(backgrounds)
     img = draw_fake_occluders(bg, num_shapes=random.randint(3, 10))
     return np.array(img)[:, :, ::-1].copy()
 
@@ -769,8 +952,9 @@ def apply_post_augs(img_bgr: np.ndarray) -> np.ndarray:
 
     return np.clip(out, 0, 255).astype(np.uint8)
 
+
 # -----------------------
-# Placements (rotate masks together with card)
+# Placements (rotate masks together with card)  [FIXED]
 # -----------------------
 def random_single_card_instances(card_assets, W, H, num_cards: int):
     placements = []
@@ -811,12 +995,24 @@ def random_single_card_instances(card_assets, W, H, num_cards: int):
             br_img = Image.fromarray(asset.br_mask_raw, mode="L").resize((new_w, new_h), Image.NEAREST)
             br_mask_resized = (np.array(br_img) > 0)
 
+        # ROI rectangle mask in resized-card coordinates
+        roi_rect_resized = np.zeros((new_h, new_w), np.uint8)
+        rx0, ry0, rx1, ry1 = _roi_from_frac(new_w, new_h, TL_X0_F, TL_Y0_F, TL_X1_F, TL_Y1_F)
+        roi_rect_resized[ry0:ry1, rx0:rx1] = 255
+
         angle = random.uniform(-90, 90)
 
         card_rot = card_resized.rotate(angle, expand=True, resample=Image.BICUBIC)
         rot_w, rot_h = card_rot.size
         if rot_w >= W or rot_h >= H or rot_w < 5 or rot_h < 5:
             continue
+
+        # rotate ROI rect and masks with same params
+        roi_rect_rot_u8 = np.array(
+            Image.fromarray(roi_rect_resized, mode="L").rotate(
+                angle, expand=True, resample=Image.NEAREST, fillcolor=0
+            )
+        )
 
         tl_mask_rot = None
         br_mask_rot = None
@@ -843,9 +1039,11 @@ def random_single_card_instances(card_assets, W, H, num_cards: int):
             "bbox": (xmin, ymin, xmax, ymax),
             "tl_mask": tl_mask_rot,
             "br_mask": br_mask_rot,
+            "roi_rect_u8": roi_rect_rot_u8,
         })
 
     return placements
+
 
 # -----------------------
 # Compose & label
@@ -904,38 +1102,39 @@ def compose_on_background(bg_img: Image.Image, placements: List[dict]):
             continue
 
         def handle_corner_mask(cmask: Optional[np.ndarray]):
-            if cmask is None:
-                return
-            if cmask.shape != (rot_h, rot_w):
+            if cmask is None or cmask.shape != (rot_h, rot_w):
                 return
 
-            corner_crop = cmask[ly0:ly1, lx0:lx1]
-            if corner_crop.size == 0:
-                return
-
-            ink_full = corner_crop & card_crop
-            full_area = int(ink_full.sum())
+            ink_card = (cmask & card_local_mask)
+            full_area = int(ink_card.sum())
             if full_area < MIN_INK_PIXELS_GLOBAL:
                 return
 
+            ink_inframe = ink_card[ly0:ly1, lx0:lx1]
+            inframe_area = int(ink_inframe.sum())
+            if inframe_area < MIN_INK_PIXELS_GLOBAL:
+                return
+
+            if (inframe_area / float(full_area)) < MIN_INFRAME_FRACTION:
+                return
+
             occ_crop = occupancy[gy0:gy1, gx0:gx1]
-            visible = ink_full & (~occ_crop)
+            visible = ink_inframe & (~occ_crop)
             vis_area = int(visible.sum())
             if vis_area < MIN_INK_PIXELS_GLOBAL:
                 return
+
             if (vis_area / float(full_area)) < MIN_VISIBLE_FRACTION:
                 return
 
-            ys, xs = np.where(ink_full)
+            ys, xs = np.where(ink_inframe)
             if xs.size == 0 or ys.size == 0:
                 return
+
             x1 = int(xs.min()) + gx0
             y1 = int(ys.min()) + gy0
             x2 = int(xs.max()) + 1 + gx0
             y2 = int(ys.max()) + 1 + gy0
-            if x2 <= x1 or y2 <= y1:
-                return
-
             annotations.append((class_id, float(x1), float(y1), float(x2), float(y2)))
 
         handle_corner_mask(p.get("tl_mask"))
@@ -973,30 +1172,34 @@ def draw_debug(idx: int, img_bgr: np.ndarray, annotations: List[Tuple[int, float
 
     if is_hard_neg:
         cv2.putText(out, "HARD_NEG", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
         cv2.imwrite(str(DEBUG_DIR / f"debug_{idx:06d}.jpg"), out)
         return
 
     if not annotations:
         cv2.putText(out, "NO_LABEL", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
         cv2.imwrite(str(DEBUG_DIR / f"debug_{idx:06d}.jpg"), out)
         return
 
     for class_id, x1, y1, x2, y2 in annotations:
         x1i, y1i, x2i, y2i = map(int, [x1, y1, x2, y2])
-        cv2.rectangle(out, (x1i, y1i), (x2i, y2i), (0, 255, 255), 2)
+        cv2.rectangle(out, (x1i, y1i), (x2i, y2i), (0, 0, 255), 2)
         cv2.putText(out, LABEL_ORDER[class_id], (x1i, max(0, y1i - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
     cv2.imwrite(str(DEBUG_DIR / f"debug_{idx:06d}.jpg"), out)
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--num", type=int, default=2500)
-    ap.add_argument("--debug_n", type=int, default=60)
+    ap.add_argument("--num", type=int, default=20)
+    ap.add_argument("--debug_n", type=int, default=20)
     ap.add_argument("--hard_neg_prob", type=float, default=HARD_NEG_PROB_DEFAULT)
+
+    # ROI/hull debug for generated cards
+    ap.add_argument("--roi_debug", action="store_true", help="Save ROI rectangle + hull overlays per generated card")
+    ap.add_argument("--roi_debug_max_imgs", type=int, default=200, help="Max composite images to dump per run (each may contain multiple cards)")
     return ap.parse_args()
 
 
@@ -1019,6 +1222,7 @@ def main():
     total_labels = 0
     hard_neg_count = 0
 
+    roi_debug_budget = int(args.roi_debug_max_imgs)
 
     for i in tqdm(range(args.num), desc="Generating corner-mask dataset"):
         bg_img = random.choice(backgrounds)
@@ -1029,7 +1233,7 @@ def main():
             hard_neg_count += 1
             img_bgr = make_hard_negative_example(bg_img)
             img_bgr = apply_post_augs(img_bgr)
-            save_example(i, img_bgr, [])  # no labels
+            save_example(i, img_bgr, [])
             if i < args.debug_n:
                 draw_debug(i, img_bgr, [], is_hard_neg=True)
             continue
@@ -1047,6 +1251,20 @@ def main():
                 draw_debug(i, img_bgr, [], is_hard_neg=True)
             continue
 
+        # ---- per-generated-card ROI/hull debug (BEFORE composing) ----
+        if args.roi_debug and roi_debug_budget > 0:
+            for j, p in enumerate(placements):
+                card_rgba = p["img"]
+                roi_u8 = p.get("roi_rect_u8", None)
+                tl_u8 = _mask_u8_from_bool(p.get("tl_mask", None))
+                br_u8 = _mask_u8_from_bool(p.get("br_mask", None))
+
+                vis_bgr = _draw_roi_and_hulls_on_rgba(card_rgba, roi_u8, tl_u8, br_u8)
+                out_path = ROI_DEBUG_GEN_CARDS_DIR / f"gen_{i:06d}_card{j}_{p['cls']}.jpg"
+                cv2.imwrite(str(out_path), vis_bgr)
+
+            roi_debug_budget -= 1
+
         img_bgr, annotations = compose_on_background(bg_img, placements)
         img_bgr = apply_post_augs(img_bgr)
 
@@ -1058,14 +1276,13 @@ def main():
         if i < args.debug_n:
             draw_debug(i, img_bgr, annotations, is_hard_neg=False)
 
-
-
-
     print(f"[DONE] Generated {args.num} images")
     print(f"[SANITY] Images with >=1 label: {labeled_count}/{args.num}")
     if labeled_count > 0:
         print(f"[SANITY] Total corner labels: {total_labels} (avg {total_labels/labeled_count:.2f} per labeled image)")
     print(f"[SANITY] Debug images saved to: {DEBUG_DIR.resolve()}")
+    print(f"[SANITY] ROI debug raw assets: {ROI_DEBUG_ASSETS_DIR.resolve()}")
+    print(f"[SANITY] ROI debug generated cards: {ROI_DEBUG_GEN_CARDS_DIR.resolve()}")
     print(f"[SANITY] Mask cache saved to: {MASK_CACHE_DIR.resolve()} (version={CACHE_VERSION})")
     print(f"[SANITY] Hard negatives: {hard_neg_count}/{args.num} ({hard_neg_count/args.num:.2%})")
 

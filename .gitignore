@@ -30,6 +30,7 @@ data/yolo_cards_corners/
 data/yolo_cards_single/
 data/yolo_cards_seg/
 data/generated/
+data/roboflow_playing_cards/
 
 # Do NOT ignore raw_cards or backgrounds (these are source assets)
 !data/raw_cards/
